@@ -1,0 +1,1748 @@
+---
+title: "MDRD: Main Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+lib_paths <- .libPaths()
+lib_paths <- c("//win.ad.jhu.edu/Users$/HOME/R/win-library/4.0", lib_paths)
+.libPaths(lib_paths)
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, fig.align="center")
+```
+
+## Load packages and functions
+
+```{r message=FALSE}
+library(readxl)
+library(tidyverse)
+library(SummarizedExperiment)
+library(limma)
+library(gridExtra)
+library(kableExtra)
+
+library(caret)
+library(glmnet)
+library(randomForest)
+```
+
+```{r}
+source("S:/lucid/code/utils.R")
+source("functions_summary_stats.R")
+source("functions_limma_analysis.R")
+source("functions_symptom_groups.R")
+source("functions_ml.R")
+source("functions_utils.R")
+```
+
+
+
+<br><br><br>
+
+
+
+## Reading data
+
+### Read metabolomics data
+
+```{r}
+## Read in row data on metabolites
+row_data <- read_excel("../../../Analysis/Metabolomics data/Original data/JHOP-0501-15MLBL+CDT  2015-12-29.xlsx", sheet = "OrigScale", range = "A11:P1204", col_names = TRUE)
+colnames(row_data)[16] <- "HMDB_ID"
+rownames(row_data) <- paste0("met", seq_len(nrow(row_data)))
+
+## Read in column data on samples
+col_data <- read_excel("../../../Analysis/Metabolomics data/Original data/JHOP-0501-15MLBL+CDT  2015-12-29.xlsx", sheet = "OrigScale", range = "P1:ACM11", col_names = FALSE)
+col_data <- col_data %>% as.matrix() %>% t()
+colnames(col_data) <- col_data[1,]
+colnames(col_data)[11] <- "Sample"
+col_data <- tail(col_data, -1)
+rownames(col_data) <- NULL
+col_data <- as.data.frame(col_data)
+
+## Read in metabolite data
+metab <- read_excel("../../../Analysis/Metabolomics data/Original data/JHOP-0501-15MLBL+CDT  2015-12-29.xlsx", sheet = "OrigScale", range = "Q11:ACM1204", col_names = TRUE)
+metab <- as.matrix(metab)
+rownames(metab) <- paste0("met", seq_len(nrow(metab)))
+
+stopifnot(nrow(metab)==nrow(row_data))
+stopifnot(ncol(metab)==nrow(col_data))
+stopifnot(identical(rownames(row_data), rownames(metab)))
+```
+
+### Read symptom data
+
+`R:\Data\PROC_Contents_pdf\mdb_1_to_98.pdf` contains documentation on all of the contents of the data files in `R:\Data\Stata_Datasets`.
+
+- `mdb_26.csv`: originally from `R:\Data\Stata_Datasets\mdb_26.dta`
+- `Followup.csv`: originally from `R:\Data\Derived\Followup.dta`.
+
+```{r}
+symptoms <- read_csv("../data/mdb_26.csv", guess_max = 27973)
+followup <- read_csv("../data/Followup.csv")
+baseline <- read_csv("../data/Baseline.csv")
+
+symptoms$id <- as.character(symptoms$id)
+followup$id <- as.character(followup$id)
+baseline$id <- as.character(baseline$id)
+```
+
+### Read in imputed data
+
+The object `col_data_mf` is the `missForest`-imputed column data.
+
+The object `log_metab_subs_qrilc` is the `imputeLCMD::impute.QRILC`-imputed metabolomics data.
+
+```{r}
+load("../data/col_data_imputed.rda")
+load("../data/metab_imputed_qrilc.rda")
+```
+
+Check that the sample ordering in the imputed metabolomics data is the same as in `col_data`.
+
+```{r}
+identical(log_metab_subs_qrilc$SUBJECT_ID %>% as.character(), col_data$SUBJECT_ID %>% as.character())
+```
+
+
+
+<br><br><br>
+
+
+
+## Preparing data
+
+### Merging patient data with `col_data`
+
+Merge symptoms, followup, and baseline (Visit 12). Note that `alb`, `phos`, and `hb` are measured at baseline and follow up visit 12 - use the variables in `followup` (NOT `baseline`).
+
+```{r}
+symptoms <- symptoms %>% filter(VISN==12)
+followup <- followup %>% filter(visn==12)
+baseline <- baseline %>%
+    select(id, study, bp, diet, age, female, racecat, smoke_ever, smoke_packs, smoke_years, diab, cause_ckd_ckdbc, renaldx, cad, pepulc, cancer, cerebrovasc, pvd, hyperlip, hyperten) # NOT alb, phos, hb
+
+col_data <- col_data %>%
+    mutate(SUBJECT_ID = SUBJECT_ID %>% as.character()) %>%
+    left_join(symptoms, by = c("SUBJECT_ID" = "id")) %>%
+    left_join(followup, by = c("SUBJECT_ID" = "id")) %>%
+    left_join(baseline, by = c("SUBJECT_ID" = "id"))
+```
+
+### Filling in obvious values for missing data
+
+Fill in some of the missing values for symptom severity. Currently most missing values for the severity variables ("B") are when the number of days with the symptom is zero. Obviously, if the symptom was not experienced, severity is "not applicable". Fill in a new "zero severity" category in these cases.
+
+```{r}
+symptom_cols <- sprintf("F26Q%.2i", 5:28)
+for (col in symptom_cols) {
+    col_A <- paste0(col, "A")
+    col_B <- paste0(col, "B")
+    symp_A <- col_data[[col_A]]
+    symp_B <- col_data[[col_B]]
+    bool <- symp_A==0 & is.na(symp_B)
+    symp_B[bool] <- 0
+    col_data[[col_B]] <- symp_B
+}
+```
+
+The `study` variable was not part of the imputation--add it back in to the imputed column data.
+
+```{r}
+col_data_mf <- col_data_mf %>%
+    left_join(select(col_data, SUBJECT_ID, study))
+```
+
+### Create `SummarizedExperiment` container
+
+Note: `log_abund` is a log2(x) transformation rather than a log2(x+0.5) transformation because there are no zeros (NA's instead).
+
+```{r}
+range(metab, na.rm = TRUE)
+```
+
+```{r}
+se <- SummarizedExperiment(
+    assays = list(abund = metab, log_abund = log2(metab)),
+    rowData = row_data,
+    colData = col_data
+)
+```
+
+### Filtering samples (columns)
+
+Remove samples where metabolomics subject ID doesn't have a corresponding symptoms, followup, and baseline ID.
+
+```{r}
+col_data <- colData(se)
+
+keep <- (col_data$SUBJECT_ID %in% symptoms$id) & (col_data$SUBJECT_ID %in% followup$id) & (col_data$SUBJECT_ID %in% baseline$id)
+
+se_subs <- se[,keep]
+
+## Do the same filtering in the imputed metabolomics
+all(colData(se_subs)$SUBJECT_ID %in% log_metab_subs_qrilc$SUBJECT_ID)
+log_metab_subs_qrilc <- log_metab_subs_qrilc %>%
+    filter(SUBJECT_ID %in% colData(se_subs)$SUBJECT_ID)
+```
+
+This reduces the sample size from 751 to 696.
+
+```{r}
+dim(se)
+dim(se_subs)
+```
+
+Remove samples that are outliers in terms of missingness.
+
+```{r}
+log_abund <- assay(se_subs, "log_abund")
+perc_missing <- colMeans(is.na(log_abund))
+
+## Visualize the % missingness distribution across samples
+plot(density(perc_missing, from = 0, to = 1), xlab = "Percent of metabolites with missing abundances", main = "")
+
+## Which samples have a high degree of missingness?
+which(perc_missing > 0.8)
+
+## What is the distribution of missingness in the other samples?
+summary(perc_missing[perc_missing < 0.8])
+
+## Subset
+se_subs <- se_subs[,perc_missing < 0.8]
+
+## Do the same filtering in the imputed metabolomics
+all(colData(se_subs)$SUBJECT_ID %in% log_metab_subs_qrilc$SUBJECT_ID)
+log_metab_subs_qrilc <- log_metab_subs_qrilc %>%
+    filter(SUBJECT_ID %in% colData(se_subs)$SUBJECT_ID)
+```
+
+This reduces the sample size from 696 to 695.
+
+```{r}
+dim(se_subs)
+```
+
+Check if there are samples that have an NA for the `study`, `bp`, and `diet` variables (arms of the MDRD study). There are none.
+
+```{r}
+col_data <- colData(se_subs)
+table(col_data$study, useNA = "ifany")
+table(col_data$bp, useNA = "ifany")
+table(col_data$diet, useNA = "ifany")
+```
+
+```{r}
+col_data %>% as.data.frame() %>% dplyr::count(study, bp, diet)
+```
+
+Remove the `SUBJECT_ID` column from the imputed metabolomics data, and store the subject IDs as row names.
+
+```{r}
+rownames(log_metab_subs_qrilc) <- log_metab_subs_qrilc$SUBJECT_ID
+log_metab_subs_qrilc$SUBJECT_ID <- NULL
+```
+
+### Filtering metabolites (rows)
+
+- Remove metabolites where only 9 or fewer samples have a measurement. (Require non-missing measurements in at least 10 samples.)
+- Remove metabolites where the variance in abundance among non-missing values is zero.
+
+```{r}
+log_abund <- log2(metab)
+keep <- rowSums(!is.na(log_abund)) >= 10 & rowVars(as.matrix(log_abund), na.rm = TRUE) > 1e-6
+
+se_subs <- se_subs[keep,]
+```
+
+This reduces the number of metabolites from 1193 to 1157.
+
+```{r}
+dim(se_subs)
+```
+
+Metabolite names match between the imputed data and SummarizedExperiment.
+
+```{r}
+identical(colnames(log_metab_subs_qrilc), rownames(se_subs))
+```
+
+### Orient imputed metabolomics data to align with SummarizedExperiment
+
+```{r}
+log_metab_subs_qrilc <- log_metab_subs_qrilc %>% t()
+```
+
+Also add the imputed metabolomics data (`log_metab_subs_qrilc`) to the SummarizedExperiment objects:
+
+```{r}
+## Alignment checks
+dim(log_metab_subs_qrilc)
+dim(se_subs)
+identical(colnames(log_metab_subs_qrilc), colData(se_subs)$SUBJECT_ID)
+
+## Add imputed to Summarized Experiment
+assays(se_subs, withDimnames=FALSE)$log_abund_qrilc <- log_metab_subs_qrilc
+```
+
+A short check on the relationship between oxalate and m/eGFR.
+
+```{r}
+oxalate_index <- which(str_detect(rowData(se_subs)$BIOCHEMICAL, "oxalate"))
+rowData(se_subs)$BIOCHEMICAL[oxalate_index]
+oxalate_log_abund <- assay(se_subs[oxalate_index,], "log_abund") %>% as.numeric()
+data_gfr_oxalate <- colData(se_subs) %>%
+    as.data.frame() %>%
+    mutate(
+        afr_am = racecat=="Black",
+        egfr = 175*(scr^-1.154)*(age^-0.203)*(ifelse(female==1, 0.742, 1))*(ifelse(afr_am, 1.212, 1)),
+        oxalate = oxalate_log_abund
+    ) %>%
+    select(egfr, gfr, oxalate)
+
+ggplot(data_gfr_oxalate, aes(x = gfr, y = oxalate)) +
+    geom_point() + 
+    geom_smooth() +
+    theme_bw() +
+    labs(x = "mGFR", y = "Oxalate log2 abundance", title = "mGFR vs oxalate (ethanedioate) log2 abundance")
+cor(log(data_gfr_oxalate$gfr), data_gfr_oxalate$oxalate, use = "complete.obs")
+
+ggplot(data_gfr_oxalate, aes(x = egfr, y = oxalate)) +
+    geom_point() + 
+    geom_smooth() +
+    theme_bw() +
+    labs(x = "eGFR", y = "Oxalate log2 abundance", title = "eGFR vs oxalate (ethanedioate) log2 abundance")
+cor(log(data_gfr_oxalate$egfr), data_gfr_oxalate$oxalate, use = "complete.obs")
+```
+
+## Batch effects
+
+The following information can help determine batch.
+
+```{r}
+head(colData(se_subs)[,1:8])
+```
+
+`GROUP_DESCRIPTION` and `GROUP_DESCRIPTION` are not helpful.
+
+```{r}
+unique(colData(se_subs)$GROUP_DESCRIPTION)
+unique(colData(se_subs)$GROUP_NUMBER)
+```
+
+Check the `BOX` and `POSITION` variables. `BOX` should define batch, and `POSITION` is unique within each `BOX`.
+
+```{r}
+batch_data <- tibble(
+    box = colData(se_subs)$BOX %>% as.character(),
+    position = colData(se_subs)$POSITION %>% as.character() %>% as.integer()
+)
+nrow(unique(batch_data)) # Should be 695
+batch_data %>%
+    dplyr::count(box)
+batch_data %>%
+    group_by(box) %>%
+    summarize(n = length(unique(position)))
+
+## Define batch variable
+batch_data$batch <- str_extract(batch_data$box, "[0-9]{1}$") %>% as.integer()
+```
+
+There isn't a very clear indication of persistent batch effects. *Maybe* only at the later PCs (e.g., PC5).
+
+```{r}
+Y <- assay(se_subs, "log_abund") %>% t()
+Y[is.na(Y)] <- 0
+# keep <- colVars(Y, na.rm=TRUE) > 0
+# Y <- Y[,keep,drop=FALSE]
+pc_out <- prcomp(Y, center = TRUE, scale. = TRUE)
+
+unique_colors <- rainbow(length(unique(batch_data$batch)), alpha = 0.5)
+colors <- unique_colors[batch_data$batch]
+plot(pc_out$x[,"PC1"], pc_out$x[,"PC2"], col = colors, xlab = "PC1", ylab = "PC2")
+```
+
+```{r fig.width=15, fig.height=10}
+pairs(pc_out$x[,1:10], col = colors)
+```
+
+```{r}
+var_explained <- pc_out$sdev^2
+percent_var_explained <- 100*var_explained/sum(var_explained)
+par(mfrow = c(1,2))
+plot(percent_var_explained[1:20], xlab = "PC", ylab = "Percentage", main = "% variance explained", pch = 16)
+plot(cumsum(percent_var_explained[1:20]), xlab = "PC", ylab = "Cumulative percentage", main = "Cumulative % variance explained", pch = 16)
+```
+
+
+<br><br><br>
+
+
+## Descriptive statistics
+
+### Lab and demographic variables
+
+Below are summaries of baseline characteristics at visit 12.
+
+The variables adjusted for in the analysis include the following:
+
+- age + female + racecat + diab + cause_ckd_ckdbc + smoke_status + sys + upro + uun + gfr + bmi + study + bp + diet
+- sys: systolic BP (mmHg)
+- upro: urine protein (g/d)
+- uun: urine urea nitrogen (g/d)
+- gfr: measured GFR = Mean baseline iothalamate measured GFR (ml/min/1.73m^2)
+- study: study arm (1 or 2, also called A and B in the literature, it seems)
+- bp: Blood pressure arm (moderate or low)
+- diet: Diet targeting arm (very low, low, usual)
+
+**Summary statistics for mGFR < 20:** Note, because there were some missing values in the `gfr` variable, the patients included in this subset include the ones whose ***imputed*** GFR was less than 20. The actual GFR values were left as `NA`'s if they were missing to begin with.
+
+```{r}
+col_data_temp <- tibble(SUBJECT_ID = colData(se_subs)$SUBJECT_ID) %>%
+    left_join(col_data_mf)
+bool_gfr_below_20 <- col_data_temp$gfr < 20
+col_data <- colData(se_subs)
+
+col_data_gfr_below_20 <- col_data[bool_gfr_below_20,,drop=FALSE]
+display_summary_stats_baseline(col_data_gfr_below_20)
+```
+
+**Summary statistics for mGFR > 20:**
+
+```{r}
+col_data_gfr_above_20 <- col_data[!bool_gfr_below_20,,drop=FALSE]
+display_summary_stats_baseline(col_data_gfr_above_20)
+```
+
+**Summary statistics for all of MDRD:**
+
+```{r}
+display_summary_stats_baseline(col_data, plot = TRUE)
+```
+
+### Summary statistics for symptoms
+
+**Summary statistics for mGFR < 20:**
+
+```{r}
+display_summary_stats_symptoms(col_data_gfr_below_20)
+```
+
+**Summary statistics for mGFR > 20:**
+
+```{r}
+display_summary_stats_symptoms(col_data_gfr_above_20)
+```
+
+**Summary statistics for all of MDRD:**
+
+```{r}
+display_summary_stats_symptoms(col_data)
+```
+
+**Symptom summary statistics by MDRD study arm**
+
+```{r}
+symptom_df <- get_symptom_definitions()
+symptom_stats_all_mdrd <- get_summary_stats_symptoms(col_data)
+symptom_stats_mgfr20 <- get_summary_stats_symptoms(col_data_gfr_below_20)
+symptom_stats_combined <- bind_rows(
+    symptom_stats_all_mdrd %>% mutate(group = "Total Group"),
+    symptom_stats_mgfr20 %>% mutate(group = "mGFR < 20")
+) %>%
+    mutate(symptom_descrip = factor(symptom_descrip, levels = symptom_df$descrip[c(1:7,9:11,8)], labels = c("Bad taste", "Loss of appetite", "Nausea", "Vomiting", "Itching", "Lack of pep and energy", "Tiring easily", "Daytime sleepiness", "Decreased alertness", "Forgetfulness", "Numbness / tingling"))) %>%
+    mutate(
+        study_bp = paste("BP:", study_bp),
+        study_diet = paste("Protein:", study_diet)
+    )
+
+pdf("../results/figures/symptomatic_by_arm.pdf", width = 8, height = 5, useDingbats = FALSE)
+ggplot(symptom_stats_combined, aes(x = symptom_descrip, y = frac_symptomatic, color = group)) +
+    geom_point() +
+    facet_grid(study_bp ~ study_diet) +
+    theme_classic() +
+    geom_vline(xintercept = c(4.5, 5.5, 10.5), color = "gray70", lty = "dashed") +
+    labs(color = "", x = "", y = "Fraction symptomatic") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+dev.off()
+```
+
+**Comparing all MDRD to mGFR < 20:** Note: the inferential results here (p-values and CIs) are a little anti-conservative because the observations in the groups are not independent (because the < 20 group is a subset of the full group).
+
+```{r}
+compare_symptomatic(col_data, col_data_gfr_below_20)
+```
+
+### Urine urea nitrogen across diet arms
+
+To address reviewer concerns about confounding related to the diet arm part of the study, we can perform sensitivity analyses in subgroups related to patient's actual protein levels (an as-treated analysis in comparison to an ITT analysis looking at subgroups defined by the randomization arm).
+
+`uun` is the preferred measures of dietary protein intake. The tertiles form sensible thresholds for breaking `uun` into low, medium, and high subgroups that correspond fairly well with randomization arms. Create a `uun_cat` variable that indicates the low, medium, and high subgroups.
+
+```{r}
+col_data %>%
+    as.data.frame() %>%
+    group_by(diet) %>%
+    summarize(mean_uun = mean(uun, na.rm = TRUE))
+
+quantile(col_data$uun, probs = 1:3/3, na.rm = TRUE)
+
+col_data %>%
+    as.data.frame() %>%
+    ggplot(aes(x = uun)) +
+        geom_histogram()
+
+col_data %>%
+    as.data.frame() %>%
+    ggplot(aes(x = diet, y = uun)) +
+        geom_boxplot() +
+        geom_hline(yintercept = quantile(col_data$uun, probs = 1:3/3, na.rm = TRUE))
+
+uun_tertiles <- quantile(col_data$uun, probs = 1:2/3, na.rm = TRUE)
+col_data$uun_cat <- case_when(
+    col_data$uun <= uun_tertiles[1] ~ "uun_low",
+    col_data$uun > uun_tertiles[1] & col_data$uun <= uun_tertiles[2] ~ "uun_med",
+    col_data$uun >= uun_tertiles[2] ~ "uun_high"
+)
+
+col_data %>%
+    as.data.frame() %>%
+    dplyr::count(uun_cat)
+```
+
+### Distribution of missing data for metabolomics
+
+```{r}
+log_metab <- assay(se_subs, "log_abund")
+frac_missing <- rowMeans(is.na(log_metab))
+summary(frac_missing)
+plot(density(frac_missing, from = 0, to = 1))
+```
+
+<br><br><br>
+
+
+
+## `limma` analysis
+
+Regarding missing data for symptoms:
+
+- Do NOT run an analysis where cases with missing symptom data are excluded
+    - Because separate analyses are conducted for each symptom, this would entail using a different set of cases for each symptom. This is not ideal for fair comparison of results across symptoms.
+    - THUS, best to use only imputed symptoms data
+
+Regarding missing data for lab/demographics:
+
+- Run analyses for both (1) imputed data and (2) where cases with missing data are excluded from the analytic dataset
+
+### Explorations to inform categorization of symptom scores
+
+What is the distribution of symptom scores for each symptom?
+
+```{r}
+col_data_mf_subs <- col_data_mf %>%
+    filter(SUBJECT_ID %in% colData(se_subs)$SUBJECT_ID)
+symptom_df <- get_symptom_definitions()
+for (i in seq_len(nrow(symptom_df))) {
+    cat(symptom_df$descrip[i], "---------------\n")
+    ## Compute the symptom scores
+    symp_score <- get_symptom_score(symptom_df$num[i], col_data_mf_subs)
+    ## Tabulate the symptom scores
+    print(table(symp_score))
+}
+```
+
+Look at the day-severity combinations. Roughly, the following types exist:
+
+- Zero
+- Severity = 1, 2, 3
+    - Roughly all the time: days > 15
+    - Part of the month: days <= 15
+
+```{r}
+for (i in seq_len(nrow(symptom_df))) {
+    cat(symptom_df$descrip[i], "---------------\n")
+    ## Obtain the day and severity columns for this symptom
+    days_sev <- get_symptom_days_severity(symptom_df$num[i], col_data_mf_subs)
+    dplyr::count(days_sev, days, severity) %>%
+        arrange(severity) %>% print()
+}
+```
+
+Notes
+
+- Vomiting needs special consideration because there are very few patients who experience it most of the month. (Also are there meaningful differences between severity levels for vomiting?)
+- It likely makes sense to pool cat2_less+cat3_less and cat2_more+cat3_more.
+    - For adequate sample sizes
+    - To reflect ambiguity in what defines the difference between severity level 2 and 3.
+
+```{r}
+for (i in seq_len(nrow(symptom_df))) {
+    cat(symptom_df$descrip[i], "---------------\n")
+    ## Obtain the day and severity columns for this symptom
+    days_sev <- get_symptom_days_severity(symptom_df$num[i], col_data_mf_subs)
+    ## Define new categories to see sample sizes
+    days_sev <- days_sev %>%
+        mutate(symp_cat = case_when(
+            severity==1 & days <= 15 ~ "cat1_less",
+            severity==1 & days > 15 ~ "cat1_most",
+            severity==2 & days <= 15 ~ "cat2_less",
+            severity==2 & days > 15 ~ "cat2_most",
+            severity==3 & days <= 15 ~ "cat3_less",
+            severity==3 & days > 15 ~ "cat3_most",
+            days==0 ~ "cat0"
+        ))
+    days_sev %>% dplyr::count(symp_cat) %>% print()
+}
+```
+
+
+### Notes about the analysis
+
+> Reference for `limma` contrasts:
+> http://bioconductor.org/help/course-materials/2005/BioC2005/labs/lab01/estrogen/
+    
+The variables adjusted for in the analysis include the following:
+
+- age + female + racecat + diab + cause_ckd_ckdbc + smoke_status + sys + upro + uun + gfr + bmi + study + bp + diet
+- sys: systolic BP (mmHg)
+- upro: urine protein (g/d)
+- uun: urine urea nitrogen (g/d)
+- gfr: measured GFR = Mean baseline iothalamate measured GFR (ml/min/1.73m^2)
+- study: study arm (1 or 2)
+- bp: Low or Moderate
+- diet: Very Low, Low, or Usual
+
+
+### Guide to versions
+
+The different variations of the analysis will be numbered as sequential versions. These variations are described in the table below.
+
+Abbreviations:
+
+- rf: random forest
+
+```{r echo=FALSE}
+version_df <- data.frame(
+    version = 1:2,
+    impute_metab = rep("none", 2),
+    impute_lab_demo = rep("rf", 2),
+    sample_subset = c("All MDRD", "mGFR < 20")
+)
+
+print(version_df)
+```
+
+### Analysis version 1: ALL MDRD
+
+```{r}
+results <- run_analysis(col_data_mf, se_subs)
+results_xeno <- run_analysis(col_data_mf, se_subs, only_xeno = TRUE)
+```
+
+Below find a table of results for each symptom giving metabolites found to be associated with that symptom at a false discovery rate of 0.1.
+
+**Note:** I refer to the term "abundance". By this I am referring to the peak area reported in the Metabolon output, a measure of the (relative) amount of the metabolite present in the sample. "log2 abundance" refers to the log (base 2) of this area.
+
+The last columns in each of the tables are as follows:
+
+- `logFC`: This is the coefficient on the symptom score in the individual linear models where metabolite abundance (peak area, log2 scale) is modeled as a function of symptom score and the same covariates that Ruey included in his previous analysis.
+    - Interpretation of the coefficient itself: For example, let's say the logFC is 0.01. This means that for every one unit increase in symptom score, the log2 abundance increases by 0.01 on average, when holding the other variables fixed.
+    - Interpretation of 2^coefficient: Continuing with the example of the coefficient of 0.01. 2^0.01 = 1.00696. This is interpreted as: for every unit increase in the symptom score metabolite abundance is multiplied by 1.00696, while holding the other variables in the model fixed.
+
+- `mean_abund`: The average log2 abundance of this metabolite across all samples. For example, if this value is 26.8, then 26.8 is the average "amount" of this metabolite across samples (on the log2 scale). Because metabolomics measurements don't have units, this number itself is not very interpretable. The percentile version of this column is a useful QC metric though--see explanation about the percentile versions of columns below.
+
+- `sd_abund`: The standard deviation of the log2 abundances of this metabolite across all samples. This is a measure of the amount of spread in the "amount" of this metabolite across samples. Very low 
+
+- `cv_abund`: The coefficient of variation of the log2 abundances of this metabolite across all samples. This is a measure of the amount of spread in the "amount" of this metabolite across samples *relative to the average amount of the metabolite*. (This variable is computed as sd_abund/mean_abund.)
+
+- `perc_missing`: The *fraction* of samples in which this metabolite had a missing measurement (presumably due to limit of detection (LOD)). These numbers range from 0 to 1.
+
+For each of these columns, there is another corresponding column that is the percentile version of that variable (e.g., perc_mean_abund, etc.). These numbers range from 0 to 100. A 90 in this column for mean_abundance, for example, means that this metabolite's mean abundance is at the 90th percentile. The interpretation is the analgous for `logFC`, `sd_abund`, `cv_abund`, `perc_missing`.
+
+```{r results="asis"}
+display_write_results(results, "version1")
+```
+
+
+### Analysis version 2: mGFR < 20
+
+Subset samples to only the patients with measured GFR < 20. The `gfr` variable included in the data is described as "Mean baseline iothalamate measured GFR (ml/min/1.73m^2)".
+
+```{r}
+col_data <- tibble(SUBJECT_ID = colData(se_subs)$SUBJECT_ID) %>%
+    left_join(col_data_mf)
+bool <- col_data$gfr < 20
+se_subs_version2 <- se_subs[,bool]
+table(bool, useNA = "ifany")
+dim(se_subs_version2)
+```
+
+```{r}
+results_v2 <- run_analysis(col_data_mf, se_subs_version2)
+results_v2_xeno <- run_analysis(col_data_mf, se_subs_version2, only_xeno = TRUE)
+```
+
+```{r results="asis"}
+display_write_results(results_v2, "version2")
+```
+
+### Overlap in associated metabolites between related symptoms
+
+The symptoms analyzed are shown below.
+
+```{r}
+get_symptom_definitions()
+```
+
+They can be grouped into the following groups:
+
+Group 1: Bad Taste, Loss of Appetite, Nausea, Vomiting
+Group 2: Itching
+Group 3: Numbness/Tingling of Hands/Feet
+Group 4: Lack of Pep and Energy, Tiring Easily/Weakness, Falling Asleep During Day, Decreased Alertness, Forgetfulness
+
+```{r}
+data_compare_symp_v1 <- compare_all_symptom_groups(results)
+```
+
+The figures below are for analysis version 1 (all MDRD patients included).
+
+They show the union of all metabolites that were found to be associated with the symptoms in symptom group 2 (first figure) and symptom group 8 (second figure.) For each metabolite (shown on y-axis), the x-axis shows the adjusted fold change in metabolite abundance per 30 unit increase in symptom score. (30 was chosen because it corresponds to a change in symptom severity of 1 for a month, which is a more interpretable shift than a shift of 1 in the symptom score.) Points are shaded circles if the metabolite was found to be associated with the given symptom at a false discovery rate threshold of 10%, and they are X’s otherwise.
+
+Multiple shaded circles in a row indicates that the metabolite was found to be associated with multiple symptoms. Points that all lie on the same side of 1 (regardless of shaded circle or X) indicate that across symptoms, the direction of the association with this metabolite was consistent.
+
+```{r}
+plot_symptom_comparison(data_compare_symp_v1[[1]])
+plot_symptom_comparison(data_compare_symp_v1[[2]])
+```
+
+Below we make the same plots for analysis version 2 (only patients with mGFR < 20).
+
+```{r}
+data_compare_symp_v2 <- compare_all_symptom_groups(results_v2)
+plot_symptom_comparison(data_compare_symp_v2[[1]])
+plot_symptom_comparison(data_compare_symp_v2[[2]])
+```
+
+Combine plots and write to PDF.
+
+- The file `symptom_group_nausea_comparison_v1_v2.pdf` contains results for the nausea-related symptom group for both analysis version 1 (all MDRD) and analysis version 2 (mGFR < 20).
+- The file `symptom_group_fatigue_comparison_v1_v2.pdf` contains results for the fatigue-related symptom group for both analysis versions 1 and 2.
+
+```{r}
+pdf("../results/figures/symptom_group_nausea_comparison_v1_v2.pdf", width = 16, height = 5, useDingbats = FALSE)
+plot_symptom_comparison_both_sets(data_compare_symp_v1[[1]], data_compare_symp_v2[[1]])
+dev.off()
+
+pdf("../results/figures/symptom_group_fatigue_comparison_v1_v2.pdf", width = 16, height = 5, useDingbats = FALSE)
+plot_symptom_comparison_both_sets(data_compare_symp_v1[[2]], data_compare_symp_v2[[2]])
+dev.off()
+```
+
+
+### Comparison of all MDRD with mGFR < 20
+
+This is a comparison of analysis version 1 (all MDRD) and analysis version 2 (mGFR < 20).
+
+For every symptom, we compare results for metabolites that were found to be associated with the symptom in either version 1 or version 2 of the analysis. Below is a guide to the columns in the tables:
+
+- `shows_association`: One of “All MDRD”, “mGFR < 20”, or “Both”. Indicates whether the metabolite was associated with the symptom in just the dataset of all MDRD patients, just patients with mGFR < 20, or both datasets.
+
+- `effect_direction`:
+    - "Both +" if there is a positive association between the metabolite and symptom in both datasets.
+    - "Both -" if there is a negative association in both datasets.
+    - "All MDRD: +. mGFR < 20: -" if positive in all MDRD but negative in mGFR < 20 subset.
+    - "All MDRD: -. mGFR < 20: +" if negative in all MDRD but positive in mGFR < 20 subset.
+
+- `FC_all_mdrd`: The adjusted fold change in the all MDRD analysis (version 1). (Equal to 2^(logFC*30).)
+
+- `FC_mgfr20`: The adjusted fold change in the mGFR < 20 analysis (version 2).
+
+```{r results="asis"}
+symptom_df <- get_symptom_definitions()
+all_results_subs_list <- vector("list", length(results))
+for (i in seq_along(results)) {
+    ## Subset and format results: version 1
+    sub_results_all_mdrd <- results[[i]] %>%
+        mutate(signif_all_mdrd = adj_pval < 0.1) %>%
+        select(BIOCHEMICAL, signif_all_mdrd, logFC_all_mdrd = logFC)
+    ## Subset and format results: version 2
+    sub_results_mgfr20 <- results_v2[[i]] %>%
+        mutate(signif_mgfr20 = adj_pval < 0.1) %>%
+        select(BIOCHEMICAL, signif_mgfr20, logFC_mgfr20 = logFC)
+    ## Join both versions 1 and 2
+    all_results <- full_join(sub_results_all_mdrd, sub_results_mgfr20)
+    all_results_subs <- all_results %>%
+        filter(signif_all_mdrd | signif_mgfr20) %>%
+        mutate(
+            shows_association = case_when(
+                signif_all_mdrd & !signif_mgfr20 ~ "All MDRD",
+                !signif_all_mdrd & signif_mgfr20 ~ "mGFR < 20",
+                signif_all_mdrd & signif_mgfr20 ~ "Both"
+            ),
+            effect_direction = case_when(
+                logFC_all_mdrd > 0 & logFC_mgfr20 > 0 ~ "Both +",
+                logFC_all_mdrd < 0 & logFC_mgfr20 < 0 ~ "Both -",
+                logFC_all_mdrd > 0 & logFC_mgfr20 < 0 ~ "All MDRD: +. mGFR < 20: -",
+                logFC_all_mdrd < 0 & logFC_mgfr20 > 0 ~ "All MDRD: -. mGFR < 20: +"
+            ),
+            FC_all_mdrd = 2^(logFC_all_mdrd*30),
+            FC_mgfr20 = 2^(logFC_mgfr20*30)
+        )
+    all_results_subs_list[[i]] <- all_results_subs %>%
+        mutate(
+            symp_descrip = symptom_df$descrip[i],
+            symp_group = symptom_df$group[i]
+        )
+    all_results_subs <- all_results_subs %>%
+        select(BIOCHEMICAL, shows_association, effect_direction, FC_all_mdrd, FC_mgfr20)
+    kable_scroll_print(all_results_subs, caption = symptom_df$descrip[i], row_height_px = 40)
+    write_csv(all_results_subs, path = paste0("../results/compare_v1_v2_", symptom_df$alt_descrip[i], ".csv"))
+    cat("\n")
+}
+```
+
+
+```{r}
+all_results_subs_combined <- bind_rows(all_results_subs_list)
+all_results_subs_combined <- all_results_subs_combined %>%
+    arrange(symp_group, symp_descrip, dplyr::desc(signif_all_mdrd), dplyr::desc(signif_mgfr20), FC_all_mdrd, FC_mgfr20) %>%
+    mutate(
+        all_mdrd = paste(
+            round(FC_all_mdrd, 2),
+            ifelse(signif_all_mdrd, "(S)", "")
+        ),
+        mgfr20 = paste(
+            round(FC_mgfr20, 2),
+            ifelse(signif_mgfr20, "(S)", "")
+        )
+    ) %>%
+    select(symp_group, symp_descrip, BIOCHEMICAL, all_mdrd, mgfr20)
+
+write_csv(all_results_subs_combined, file = "../results/compare_v1_v2_all.csv")
+```
+
+
+### Sensitivity analysis: dietary protein subgroups
+
+Define a `uun_cat` variable within `col_data_mf` that breaks patients into low, medium, and high subgroups based on tertiles of *imputed `uun`*. Note that the tertiles of non-imputed and imputed `uun` are essentially identical.
+
+```{r}
+# Tertiles of non-imputed and imputed `uun` are essentially identical
+uun_tertiles # From non-imputed data
+uun_tertiles_imputed <- quantile(col_data_mf$uun, 1:2/3) # From imputed data
+uun_tertiles_imputed
+
+# Make uun_cat variable within col_data_mf
+col_data_mf <- col_data_mf %>%
+    mutate(uun_cat = 
+        case_when(
+            uun <= uun_tertiles_imputed[1] ~ "uun_low",
+            uun > uun_tertiles_imputed[1] & uun <= uun_tertiles_imputed[2] ~ "uun_med",
+            uun >= uun_tertiles_imputed[2] ~ "uun_high"
+        )
+    )
+```
+
+Run sensitivity analysis for each of the 3 subgroups. Just look at the full MDRD cohort - don't look at the mGFR < 20 subgroup because sample sizes are too small when intersected with the protein subgroups.
+
+```{r}
+uun_cat_names <- paste0("uun_", c("low", "med", "high"))
+
+results_uun_cat <- vector("list", 3)
+names(results_uun_cat) <- uun_cat_names
+
+for (uun_categ in uun_cat_names) {
+    col_data <- tibble(SUBJECT_ID = colData(se_subs)$SUBJECT_ID) %>%
+    left_join(col_data_mf)
+    
+    bool1 <- col_data$uun_cat==uun_categ
+    bool2 <- col_data$uun_cat==uun_categ & col_data$gfr < 20
+    print(table(bool2))
+    
+    se_subs_v1_this_uun_cat <- se_subs[,bool1]
+    # se_subs_v2_this_uun_cat <- se_subs[,bool2]
+    
+    results_v1_this_uun_cat <- run_analysis(col_data_mf, se_subs_v1_this_uun_cat, adj_formula = "no_uun")
+    # results_v2_this_uun_cat <- run_analysis(col_data_mf, se_subs_v2_this_uun_cat, adj_formula = "no_uun")
+    
+    results_uun_cat[[uun_categ]] <- results_v1_this_uun_cat
+}
+```
+
+Compare results from main analysis and protein subgroup analyses.
+
+```{r}
+results_comparison <- lapply(seq_along(results), function(i) {
+    get_info <- function(tt, descrip) {
+        tt_new <- tt %>%
+            mutate(
+                signif = adj_pval < 0.1,
+                eff = 2^(logFC*30),
+                eff_dir = sign(logFC)
+            ) %>%
+            select(BIOCHEMICAL, signif, eff, eff_dir)
+        colnames(tt_new) <- paste0(colnames(tt_new), c("", rep(paste0("_", descrip),3)))
+        tt_new
+    }
+    
+    tt_orig <- get_info(results[[i]], "orig")
+    tt_prot_low <- get_info(results_uun_cat$uun_low[[i]], "low")
+    tt_prot_med <- get_info(results_uun_cat$uun_low[[i]], "med")
+    tt_prot_high <- get_info(results_uun_cat$uun_low[[i]], "high")
+    
+    tt_all <- left_join(tt_orig, tt_prot_low) %>%
+        left_join(tt_prot_med) %>%
+        left_join(tt_prot_high) %>%
+        mutate(
+            num_signif_subgroups = signif_low + signif_med + signif_high,
+            num_same_eff_dir = (eff_dir_orig==eff_dir_low) + (eff_dir_orig==eff_dir_med) + (eff_dir_orig==eff_dir_high)
+        )
+    
+    tt_all
+})
+names(results_comparison) <- names(results)
+
+results_comparison_df <- lapply(seq_along(results_comparison), function(i) {
+    results_comparison[[i]] %>%
+        dplyr::filter(signif_orig) %>%
+        dplyr::count(num_same_eff_dir) %>%
+        mutate(symptom = names(results_comparison)[i])
+}) %>% bind_rows()
+
+lapply(seq_along(results_comparison), function(i) {
+    results_comparison[[i]] %>%
+        dplyr::filter(signif_orig, num_same_eff_dir != 3) %>%
+        select(BIOCHEMICAL) %>%
+        mutate(symptom = names(results_comparison)[i])
+}) %>% bind_rows()
+
+results_comparison_df2 <- lapply(seq_along(results_comparison), function(i) {
+    results_comparison[[i]] %>%
+        dplyr::filter(signif_orig) %>%
+        mutate(
+            symptom = names(results_comparison)[i],
+            eff_orig = round(eff_orig, 2),
+            eff_low = round(eff_low, 2),
+            eff_med = round(eff_med, 2),
+            eff_high = round(eff_high, 2),
+            discordant_eff_dir = num_same_eff_dir != 3
+        ) %>%
+        select(symptom, BIOCHEMICAL, eff_orig, eff_low, eff_med, eff_high, discordant_eff_dir)
+}) %>% bind_rows()
+
+write_csv(results_comparison_df2, file = "../results/protein_subgroup_sens_analysis.csv")
+
+# results_comparison_df2 <- results_comparison_df2 %>%
+#     pivot_longer(cols = starts_with("eff"), names_to = "type", values_to = "effect") %>%
+#     mutate(
+#         type = str_replace(type, "eff_", ""),
+#         type = case_when(
+#             type=="orig" ~ "Original analysis",
+#             type=="low" ~ "Low protein",
+#             type=="med" ~ "Medium protein",
+#             type=="high" ~ "High protein"
+#         )
+#     )
+```
+
+### Full sensitivity analysis
+
+Enumerate combinations of parameters for the different sensitivity analyses.
+
+```{r}
+combos <- expand.grid(
+    subset = c("v1", "v2"),
+    symptom_type = c("quant", "cat"),
+    col_data = c("mf", "keep_NA"),
+    metab = c("QRILC", "keep_NA"),
+    stringsAsFactors = FALSE
+)
+```
+
+For each parameter combination, run the analysis.
+
+```{r}
+sens_results <- vector("list", nrow(combos))
+sens_results_xeno <- vector("list", nrow(combos))
+
+for (i in seq_len(nrow(combos))) {
+    ## Choose correct objects corresponding to this set of parameters
+    ## Which data subset?
+    if (combos$subset[i]=="v1") {
+        which_se <- se_subs
+    } else if (combos$subset[i]=="v2") {
+        which_se <- se_subs_version2
+    }
+    ## Which colData?
+    if (combos$col_data[i]=="mf") {
+        which_col_data <- col_data_mf
+    } else if (combos$col_data[i]=="keep_NA") {
+        which_col_data <- colData(which_se) %>% as.data.frame()
+    }
+    sens_results[[i]] <- run_analysis(
+        col_data = which_col_data,
+        se = which_se,
+        symptom_var_type = combos$symptom_type[i],
+        metab_type = combos$metab[i]
+    )
+    sens_results_xeno[[i]] <- run_analysis(
+        col_data = which_col_data,
+        se = which_se,
+        symptom_var_type = combos$symptom_type[i],
+        metab_type = combos$metab[i],
+        only_xeno = TRUE
+    )
+}
+```
+
+How many samples were removed in the different sensitivity analyses (due to missing data)? (Rows: Symptoms. Columns: versions of the sensitivity analysis.)
+
+```{r}
+do.call(cbind, lapply(sens_results, function(res) {
+    sapply(res, function(tt) {
+        attr(tt, "samples_removed")
+    })
+}))
+```
+
+For each symptom and metabolite, count the number of times it is significant across the 16 sensitivity analysis combinations.
+
+```{r}
+## Loop over symptoms
+sens_results_signif <- lapply(symptom_df$descrip, function(symp_name) {
+    lapply(sens_results, function(res) {
+        tt_this_symp <- res[[symp_name]]
+        tt_this_symp %>% filter(adj_pval < 0.1) %>% pull(BIOCHEMICAL)
+    })
+})
+names(sens_results_signif) <- symptom_df$descrip
+sens_results_signif <- bind_cols(
+    as_tibble(combos),
+    as_tibble(sens_results_signif)
+)
+sens_results_signif <- sens_results_signif %>%
+    mutate(sens_version = paste0("sens_v", seq_along(sens_results))) %>%
+    select(sens_version, everything()) %>%
+    pivot_longer(-(sens_version:metab), names_to = "symp_name", values_to = "signif_metabs") %>%
+    left_join(select(symptom_df, descrip, symp_group = group), by = c("symp_name" = "descrip")) %>%
+    arrange(symp_group, symp_name, subset, symptom_type, col_data, metab)
+
+plot_table_list <- function(l, title = "") {
+    x <- l %>% unlist()
+    if (length(x) == 0) {
+        plot(1, type = "n", xaxt = "n", yaxt = "n", xlab = "", ylab = "n", main = title)
+    } else {
+        l %>% unlist() %>% table() %>% sort(decreasing = TRUE) %>% barplot(main = title, las = 2)
+    }
+}
+```
+
+```{r}
+def_mar <- par()$mar
+par(mar = c(15,2,1,1))
+for (sn in symptom_df$descrip) {
+    sens_results_signif %>%
+        filter(symp_name==sn) %>%
+        pull(signif_metabs) %>%
+        plot_table_list(title = sn)
+}
+par(mar = def_mar)
+```
+
+
+```{r}
+unlist(sens_results_signif$signif_metabs) %>% unique() %>% length()
+unlist(sens_results_signif$signif_metabs) %>% table() %>% sort(decreasing = TRUE)
+unlist(sens_results_signif$signif_metabs) %>% table() %>% sort(decreasing = TRUE) %>% barplot()
+```
+
+Symptom groups 1 and 4 are the only ones with multiple symptoms. Groups 2 and 3 are Itching and Numbness/Tingling of Hands/Feet, which actually have no significant metabolites across all 16 sensitivity analyses.
+
+```{r}
+table(symptom_df$group)
+```
+
+```{r eval=FALSE, echo=FALSE}
+plot_sensitivity_summary <- function(dat, title = "") {
+    par(mar = c(3,24,4,1))
+    dat <- dat %>%
+        arrange(met_name, subset, symptom_type)
+    df_plot_pos <- tibble(met_name = unique(dat$met_name))
+    df_plot_pos$y_pos_init <- seq(2, by = 3, length.out = nrow(df_plot_pos))
+    dat <- dat %>%
+        left_join(df_plot_pos)
+    dat <- dat %>%
+        mutate(
+            x_pos = case_when(
+                subset=="v1" ~ 1,
+                subset=="v2" ~ 1.1
+            ),
+            y_offset = case_when(
+                symptom_type=="quant" ~ 0.5,
+                symptom_type=="cat" ~ -0.5
+            ),
+            y_pos = y_pos_init+y_offset,
+            pch = case_when(
+                num_signif==0 ~ 22,
+                num_signif > 0 ~ 15
+            ),
+            col = case_when(
+                num_signif==0 ~ "black",
+                num_signif==1 ~ "gray90",
+                num_signif==2 ~ "gray60",
+                num_signif==3 ~ "gray30",
+                num_signif==4 ~ "black"
+            )
+        )
+    plot(dat$x_pos, dat$y_pos, pch = dat$pch, col = dat$col, xaxt = "n", yaxt = "n", bty = "l", xlim = c(0.99,3), xlab = "", ylab = "", main = title, cex = 1.5)
+    axis(side = 1, at = c(1,1.1), labels = c("All MDRD", "mGFR < 20"))
+    axis(side = 2, at = df_plot_pos$y_pos_init, labels = df_plot_pos$met_name, las = 2)
+}
+```
+
+```{r eval=FALSE, echo=FALSE}
+pdf("../results/figures/sensitivity_analysis.pdf", width = 5*5, height = 2*5)
+par(mfrow = c(2,5))
+for (g in c(1,4)) {
+    ## Obtain symptoms for this group
+    symptom_names <- symptom_df %>% filter(group==g) %>% pull(descrip)
+    
+    ## Determine number of blank plots
+    num_blank <- 5-length(symptom_names)
+    
+    ## Loop over symptoms in this group
+    for (sn in symptom_names) {
+        ## Get results for just this symptom
+        sens_results_signif_subs <- sens_results_signif %>%
+            filter(symp_name==sn)
+        
+        ## Obtain vector of significant metabolites
+        signif_metabs <- sens_results_signif_subs$signif_metabs %>% unlist() %>% unique()
+        names(signif_metabs) <- signif_metabs
+        
+        ## For each significant metabolite, get a significance
+        ## indicator for each of the sensitivity analyses
+        metab_view <- purrr::map_dfc(signif_metabs, function(met) {
+            purrr::map_lgl(sens_results_signif_subs$signif_metabs, contains_item, item = met)
+        })
+        
+        ## Add sensitivity analysis version information back in
+        metab_view <- bind_cols(
+            select(sens_results_signif_subs, sens_version:metab),
+            metab_view
+        )
+        
+        ## Long form
+        metab_view <- metab_view %>%
+            pivot_longer(-(sens_version:metab),
+                         names_to = "met_name",
+                         values_to = "signif") %>%
+            group_by(met_name, subset, symptom_type) %>%
+            summarize(num_signif = sum(signif))
+        
+        ggplot(metab_view, aes(x = subset, y = met_name, color = symptom_type)) +
+            geom_text(aes(label = num_signif))
+        plot_sensitivity_summary(metab_view, title = sn)
+    }
+    
+    ## Fill in remainder of row with blank plots
+    for (i in seq_len(num_blank)) {
+        blank_plot()
+    }
+}
+dev.off()
+```
+
+What are the effect directions across sensitivity analysis versions? (Just for the significant metabolites.)
+
+```{r}
+combos <- combos %>%
+    mutate(sens_version = paste0("sens_v", seq_len(nrow(combos))))
+
+sens_results_signif_signs <- lapply(symptom_df$descrip, function(symp_name) {
+    list_over_sens_versions <- lapply(sens_results, function(res) {
+        tt_this_symp <- res[[symp_name]]
+        ## logFC for quant
+        ## starts with "symptom_scorecat" for cat
+        tt_this_symp <- tt_this_symp %>%
+            select(met_name = BIOCHEMICAL, matches("^logFC|symptom_scorecat"))
+        if (ncol(tt_this_symp)==2) {
+            tt_this_symp <- tt_this_symp %>%
+                mutate(
+                    sign_summary = ifelse(logFC > 0, "+", "-"),
+                    sign_score = sign(logFC)
+                )
+        } else {
+            mat <- tt_this_symp %>%
+                select(starts_with("symptom_scorecat")) %>%
+                as.matrix()
+            num_pos <- rowSums(mat > 0)
+            sign_summ <- case_when(
+                num_pos==4 ~ "+",
+                num_pos==3 ~ "mostly +",
+                num_pos==2 ~ "mixed",
+                num_pos==1 ~ "mostly -",
+                num_pos==0 ~ "-"
+            )
+            sign_score_vec <- rowSums(sign(mat))*0.25
+            
+            tt_this_symp <- tt_this_symp %>%
+                mutate(
+                    sign_summary = sign_summ,
+                    sign_score = sign_score_vec
+                )
+        }
+    })
+    names(list_over_sens_versions) <- paste0("sens_v", seq_along(sens_results))
+    df_this_symptom <- bind_rows(list_over_sens_versions, .id = "sens_version")
+    df_this_symptom %>%
+        left_join(combos) %>%
+        group_by(met_name, subset, symptom_type) %>%
+        summarize(
+            direction = table_to_string(sign_summary),
+            overall_sign = sum(sign_score, na.rm = TRUE)
+        )
+})
+names(sens_results_signif_signs) <- symptom_df$descrip
+
+sens_results_signif_signs <- bind_rows(sens_results_signif_signs, .id = "symptom_name")
+sens_results_signif_signs <- ungroup(sens_results_signif_signs)
+```
+
+### Summarizing results for xenobiotics-only analyses
+
+```{r}
+data_compare_symp_v1 <- compare_all_symptom_groups(results_xeno)
+plot_symptom_comparison(data_compare_symp_v1[[1]])
+plot_symptom_comparison(data_compare_symp_v1[[2]])
+data_compare_symp_v2 <- compare_all_symptom_groups(results_v2_xeno)
+plot_symptom_comparison(data_compare_symp_v2[[1]])
+plot_symptom_comparison(data_compare_symp_v2[[2]])
+```
+
+Results for itching and neuropathy
+
+```{r}
+results_xeno[["Itching"]] %>% head() %>% select(BIOCHEMICAL, logFC, adj_pval, P.Value)
+results_xeno[["Numbness/Tingling of Hands/Feet"]] %>% head() %>% select(BIOCHEMICAL, logFC, adj_pval, P.Value)
+
+results_v2_xeno[["Itching"]] %>% head() %>% select(BIOCHEMICAL, logFC, adj_pval, P.Value)
+results_v2_xeno[["Numbness/Tingling of Hands/Feet"]] %>% head() %>% select(BIOCHEMICAL, logFC, adj_pval, P.Value)
+```
+
+```{r}
+pdf("../results/figures/symptom_group_nausea_comparison_xeno_v1_v2.pdf", width = 16, height = 5, useDingbats = FALSE)
+plot_symptom_comparison_both_sets(data_compare_symp_v1[[1]], data_compare_symp_v2[[1]])
+dev.off()
+
+pdf("../results/figures/symptom_group_fatigue_comparison_xeno_v1_v2.pdf", width = 16, height = 5, useDingbats = FALSE)
+plot_symptom_comparison_both_sets(data_compare_symp_v1[[2]], data_compare_symp_v2[[2]])
+dev.off()
+```
+
+```{r}
+get_info_xeno <- function(select_metabs, select_symptoms) {
+    res_full <- lapply(select_symptoms, function(symp) {
+        tab <- results_xeno[[symp]]
+        tab %>%
+            filter(BIOCHEMICAL %in% select_metabs) %>%
+            mutate(FC = 2^(logFC*30), signif = adj_pval < 0.1) %>%
+            select(BIOCHEMICAL, FC, signif) %>%
+            mutate(group = "Total Group", symptom = symp)
+    }) %>% bind_rows()
+    res_low_gfr <- lapply(select_symptoms, function(symp) {
+        tab <- results_v2_xeno[[symp]]
+        tab %>%
+            filter(BIOCHEMICAL %in% select_metabs) %>%
+            mutate(FC = 2^(logFC*30), signif = adj_pval < 0.1) %>%
+            select(BIOCHEMICAL, FC, signif) %>%
+            mutate(group = "mGFR < 20", symptom = symp)
+    }) %>% bind_rows()
+    bind_rows(res_full, res_low_gfr) %>%
+        arrange(BIOCHEMICAL, symptom, group)
+}
+
+metabs_interest_xeno_nausea <- unique(c(data_compare_symp_v1[[1]]$BIOCHEMICAL, data_compare_symp_v2[[1]]$BIOCHEMICAL))
+xeno_nausea <- get_info_xeno(
+    select_metabs = metabs_interest_xeno_nausea,
+    select_symptoms = names(results_xeno)[1:4]
+)
+
+# xeno_nausea <- bind_rows(
+#     data_compare_symp_v1[[1]] %>% arrange(BIOCHEMICAL, symptom) %>% mutate(group = "All MDRD"),
+#     data_compare_symp_v2[[1]] %>% arrange(BIOCHEMICAL, symptom) %>% mutate(group = "mGFR < 20")
+# )
+
+
+metabs_interest_xeno_fatigue <- unique(c(data_compare_symp_v1[[2]]$BIOCHEMICAL, data_compare_symp_v2[[2]]$BIOCHEMICAL))
+metabs_interest_xeno_fatigue <- setdiff(metabs_interest_xeno_fatigue, c("carbamazepine", "warfarin"))
+xeno_fatigue <- get_info_xeno(
+    select_metabs = metabs_interest_xeno_fatigue,
+    select_symptoms = names(results_xeno)[c(10,9,11,6,7)]
+)
+
+# xeno_fatigue <- bind_rows(
+#     data_compare_symp_v1[[2]] %>% arrange(BIOCHEMICAL, symptom) %>% mutate(group = "All MDRD"),
+#     data_compare_symp_v2[[2]] %>% arrange(BIOCHEMICAL, symptom) %>% mutate(group = "mGFR < 20") %>% dplyr::filter(!(BIOCHEMICAL %in% c("carbamazepine", "warfarin")))
+# )
+
+## Write results to file
+write_csv(xeno_nausea, file = "../results/xeno_results_nausea.csv")
+write_csv(xeno_fatigue, file = "../results/xeno_results_fatigue.csv")
+
+# sens_results_xeno
+```
+
+Why do carbamazepine and warfarin have NA coefficients? Answer: too many NAs for metabolite abundances.
+
+```{r}
+bool <- rowData(se_subs_version2)$BIOCHEMICAL=="carbamazepine"
+assay(se_subs_version2[bool,], "log_abund") %>% is.na() %>% table()
+
+bool <- rowData(se_subs_version2)$BIOCHEMICAL=="warfarin"
+assay(se_subs_version2[bool,], "log_abund") %>% is.na() %>% table()
+```
+
+### Phosphates and itching
+
+Poor evidence to say that phosphates are associated with itching
+
+```{r}
+results[["Itching"]] %>% filter(str_detect(BIOCHEMICAL, "phosphate")) %>% select(logFC, P.Value, adj_pval, BIOCHEMICAL)
+```
+
+
+```{r}
+combos
+lapply(sens_results, function(res) {
+    res[["Itching"]] %>%  filter(str_detect(BIOCHEMICAL, "phosphate"))
+})
+```
+
+
+### Plots of metabolite abundances and symptom scores
+
+Make adjusted variable plots for metabolites indicated in red in the main analysis figures and for two symptoms: tiring easily/weakness and loss of appetite.
+
+```{r}
+symptom_df <- get_symptom_definitions()
+cd <- tibble(SUBJECT_ID = colData(se_subs)$SUBJECT_ID) %>%
+    left_join(col_data_mf) %>%
+    mutate(smoke_status = smoke_years > 0)
+bool_low_gfr <- col_data$gfr < 20
+point_colors <- ifelse(bool_low_gfr, "darkorange", "black")
+
+
+## Loop over symptom numbers to get residuals for x-axis of AV plot
+symp_score_resid_list <- lapply(seq_len(nrow(symptom_df)), function(i) {
+    symp_score <- get_symptom_score(symptom_df$num[i], cd, symptom_var_type = "quant")
+    cd_new <- cd %>% mutate(symptom_score = symp_score)
+    mod <- lm(symptom_score ~ age + female + racecat + diab + cause_ckd_ckdbc + smoke_status + sys + upro + uun + gfr + bmi + study + bp + diet, data = cd_new)
+    resid_X <- residuals(mod, na.action = na.pass)
+    resid_X
+})
+names(symp_score_resid_list) <- symptom_df$descrip
+symp_score_resid_list <- symp_score_resid_list[c("Loss of Appetite", "Tiring Easily/Weakness")]
+
+## Get top metabolites that have significant associations with symptoms in both All MDRD and mGFR < 20
+data_v1 <- compare_all_symptom_groups(results)
+data_v2 <- compare_all_symptom_groups(results_v2)
+metabs_v1 <- unique(c(data_v1[[1]]$BIOCHEMICAL, data_v1[[2]]$BIOCHEMICAL))
+metabs_v2 <-  unique(c(data_v2[[1]]$BIOCHEMICAL, data_v2[[2]]$BIOCHEMICAL))
+common_metabs <- intersect(metabs_v1, metabs_v2)
+
+metab_resid_list <- lapply(common_metabs, function(met) {
+    bool <- rowData(se_subs)$BIOCHEMICAL==met
+    log_abund <- assay(se_subs[bool,], "log_abund") %>% as.numeric()
+    cd_new <- cd %>% mutate(log_abund = log_abund)
+    mod <- lm(log_abund ~ age + female + racecat + diab + cause_ckd_ckdbc + smoke_status + sys + upro + uun + gfr + bmi + study + bp + diet, data = cd_new)
+    resid_Y <- log_abund - predict(mod, newdata = cd_new, na.action = na.pass)
+    resid_Y
+})
+names(metab_resid_list) <- common_metabs
+
+## Set up plot axes
+xlim <- range(unlist(symp_score_resid_list), na.rm = TRUE)
+ylim <- range(unlist(metab_resid_list), na.rm = TRUE)
+
+pdf("../results/figures/avplots_top_metabs.pdf", width = 4*5, height = 8*4)
+par(mfrow = c(8,4), mar = c(3,1,3,1))
+for (i in seq_along(symp_score_resid_list)) {
+    for (j in seq_along(metab_resid_list)) {
+        title <- paste0(names(symp_score_resid_list)[i], "\n", names(metab_resid_list)[j])
+        plot(x = symp_score_resid_list[[i]], y = metab_resid_list[[j]], main = title, xlim = xlim, ylim = ylim, bty = "l", xaxt = "n", yaxt = "n", pch = 16, col = point_colors)
+        dat <- data.frame(x = symp_score_resid_list[[i]], y = metab_resid_list[[j]])
+        mod <- lm(y ~ x, data = dat)
+        abline(a = coef(mod)[1], b = coef(mod)[2], col = "deepskyblue")
+    }
+}
+dev.off()
+```
+
+<br><br><br>
+
+
+
+## Machine learning models
+
+### Fit ML models
+
+The ML models are being fit in both the full MDRD (version 1) and mGFR < 20 (version 2) sets.
+
+We will keep the symptom score as a quantitative variable. We won't explore it as a categorical variable because there isn't a clear way to regress out the lab and demographic parts to get "residuals" that act as the new outcome.
+
+```{r eval=FALSE}
+set.seed(468)
+system.time({
+results_ml_v1 <- fit_ml_models(col_data_mf, se_subs, log_abund = log_metab_subs_qrilc)
+})
+
+## Subset log_metab_subs_qrilc to match se_subs
+all(colData(se_subs_version2)$SUBJECT_ID %in% colnames(log_metab_subs_qrilc))
+keep <- colnames(log_metab_subs_qrilc) %in% colData(se_subs_version2)$SUBJECT_ID
+
+log_metab_subs_qrilc_v2 <- log_metab_subs_qrilc[,keep,drop=FALSE]
+
+system.time({
+results_ml_v2 <- fit_ml_models(col_data_mf, se_subs_version2, log_abund = log_metab_subs_qrilc_v2)
+})
+
+results_ml <- list(v1 = results_ml_v1, v2 = results_ml_v2)
+
+save(results_ml, file = "../data/results_ml.rda")
+```
+
+### Results from ML models
+
+The results files starting with `metab_importance` are tables giving "importance measures" of the different metabolites in two different machine learning models: LASSO and random forest models. Importance measures are computed in different ways for the two models and are described in the manuscript.
+
+Column descriptions follow:
+
+- `importance_lasso` and `importance_rf`: The actual importance measure from the two methods. These columns themselves are not as important as the columns that start with `rank_`.
+
+- `rank_lasso` and `rank_rf`: Respectively for the LASSO and random forest models, what is the ranking of the importance of this metabolite? Rank 1 indicates the highest importance of the metabolite in predicting symptom score.
+
+- `rank_limma_v1`: The ranking of this metabolite according to the p-value from the limma analysis VERSION 1 (all MDRD). NA if this metabolite was excluded from `limma` analyses (due to being Xenobiotic or unidentified).
+
+- `rank_limma_v2`: The ranking of this metabolite according to the p-value from the limma analysis VERSION 2 (mGFR < 20). NA if this metabolite was excluded from `limma` analyses.
+
+- The remaining columns are metabolite metadata.
+
+```{r}
+load("../data/results_ml.rda")
+
+row_data <- rowData(se_subs) %>% as.data.frame()
+row_data$metab_id <- rownames(row_data)
+
+symptom_df <- get_symptom_definitions()
+
+ml_result_list <- vector("list", nrow(symptom_df))
+names(ml_result_list) <- symptom_df$descrip
+for (i in seq_len(nrow(symptom_df))) {
+    var_imp_list <- lapply(1:2, function(v) {
+        results_ml_version <- results_ml[[v]]
+        lasso_mod <- results_ml_version[[i]][[1]]
+        rf_mod <- results_ml_version[[i]][[2]]
+        
+        ## Variable importance
+        var_imp_lasso <- var_importance(lasso_mod, "glmnet") %>%
+            mutate(rank_lasso = rank(-1*importance_lasso, ties.method = "min"))
+        var_imp_rf <- var_importance(rf_mod, "rf") %>%
+            mutate(rank_rf = rank(-1*importance_rf, ties.method = "min"))
+        var_imp_combined <- full_join(var_imp_lasso, var_imp_rf)
+        
+        ## Add version number to column names
+        version_string <- paste0("v", v)
+        colnames(var_imp_combined) <- paste0(
+            colnames(var_imp_combined),
+            "_",
+            version_string
+        )
+        colnames(var_imp_combined)[str_detect(colnames(var_imp_combined), "metab_id")] <- "metab_id"
+        
+        var_imp_combined
+    })
+    
+    var_imp_combined <- full_join(var_imp_list[[1]], var_imp_list[[2]])
+    
+    ## Get ranks of importance from limma
+    df_ranks_limma_v1 <- tibble(
+        metab_id = results[[i]]$metab_id,
+        rank_limma_v1 = rank(results[[i]]$P.Value, ties.method = "min")
+    )
+    df_ranks_limma_v2 <- tibble(
+        metab_id = results_v2[[i]]$metab_id,
+        rank_limma_v2 = rank(results_v2[[i]]$P.Value, ties.method = "min")
+    )
+    
+    ## Join limma and ML ranks of importance
+    var_imp_combined <- var_imp_combined %>%
+        left_join(df_ranks_limma_v1) %>%
+        left_join(df_ranks_limma_v2) %>%
+        left_join(row_data) %>%
+        mutate(
+            avg_rank_v1 = (rank_lasso_v1+rank_rf_v1+rank_limma_v1)/3,
+            avg_rank_v2 = (rank_lasso_v2+rank_rf_v2+rank_limma_v2)/3
+        ) %>%
+        arrange(avg_rank_v2) %>%
+        select(metab_id, PATHWAY_SORTORDER:HMDB_ID, starts_with("avg_rank"), matches("^rank_.+v1$"), matches("^rank_.+v2$"), matches("^importance_.+v1$"), matches("^importance_.+v2$"))
+    
+    ## Store a subset of results in ml_result_list
+    var_imp_combined_subs <- var_imp_combined %>%
+        select(met_name = BIOCHEMICAL, rank_lasso_v1, rank_lasso_v2, rank_rf_v1, rank_rf_v2) %>%
+        mutate_at(c("rank_lasso_v1", "rank_lasso_v2", "rank_rf_v1", "rank_rf_v2"), function(x) { x/nrow(var_imp_combined) })
+    ml_result_list[[i]] <- var_imp_combined_subs
+    
+    ## Write to file
+    write_csv(var_imp_combined, path = paste0("../results/metab_importance_", symptom_df$alt_descrip[i], ".csv"))
+}
+
+ml_results_df <- bind_rows(ml_result_list, .id = "symptom_name")
+ml_results_df <- ml_results_df %>%
+    mutate(
+        rank_lasso_v1 = (2-2*rank_lasso_v1),
+        rank_rf_v1 = (2-2*rank_rf_v1),
+        rank_lasso_v2 = (4-2*rank_lasso_v2),
+        rank_rf_v2 = (4-2*rank_rf_v2)
+    )
+```
+
+Make plots and table of sensitivity analysis results that also incorporate the machine learning results.
+
+- Figures: `results/figures/sensitivity_analysis_symptom_group[1,4].pdf`
+- Tables: `results/sensitivity_analysis_symptom_group[1,4].csv`
+
+The columns in the tables are as follows:
+
+- `symptom_name`: Name of symptom
+- `met_name`: Name of metabolite
+- `subset`: Either "All MDRD" or "mGFR < 20"
+- `symptom_type`: Either "quantitative" or "categorical"
+- `num_signif`: There are 4 remaining axes of sensitivity analyses (impute metabolomics: yes/no & impute lab+demographics: yes/no). Out of these 4, in how many sensitivity analyses was this metabolite significant?
+- `direction`: A text description of the direction of association across the 4 aforementioned axes of the sensitivity analyses.
+    - Format: [descriptor of sign category]: [number from 1-4]
+        - Multiple categories are separated by a period.
+    - Descriptors of sign categories:
+        - `+`: For quantitative symptom score, positive association. For categorical symptom score, all 4 coefficients are positive.
+        - `-`: For quantitative symptom score, negative association. For categorical symptom score, all 4 coefficients are negative.
+        - `Mostly +`: For categorical score only. 3 out of 4 coefficients are positive.
+        - `Mostly -`: For categorical score only. 3 out of 4 coefficients are negative.
+        - `Mixed`: For categorical score only. 2 out of 4 coefficients are positive, and 2 out of 4 are negative. 
+
+
+```{r}
+for (g in c(1,4)) {
+    ## Obtain symptoms for this group
+    symptom_names <- symptom_df %>% filter(group==g) %>% pull(descrip)
+    
+    metab_view_list <- lapply(symptom_names, function(sn) {
+        ## Get results for just this symptom
+        sens_results_signif_subs <- sens_results_signif %>%
+            filter(symp_name==sn)
+        
+        ## Obtain vector of significant metabolites
+        signif_metabs <- sens_results_signif_subs$signif_metabs %>% unlist() %>% unique()
+        names(signif_metabs) <- signif_metabs
+        
+        ## For each significant metabolite, get a significance
+        ## indicator for each of the sensitivity analyses
+        metab_view <- purrr::map_dfc(signif_metabs, function(met) {
+            purrr::map_lgl(sens_results_signif_subs$signif_metabs, contains_item, item = met)
+        })
+        
+        ## Add sensitivity analysis version information back in
+        metab_view <- bind_cols(
+            select(sens_results_signif_subs, sens_version:metab),
+            metab_view
+        )
+        
+        ## Long form
+        metab_view <- metab_view %>%
+            pivot_longer(-(sens_version:metab),
+                         names_to = "met_name",
+                         values_to = "signif") %>%
+            group_by(met_name, subset, symptom_type) %>%
+            summarize(num_signif = sum(signif))
+    })
+    names(metab_view_list) <- symptom_names
+    
+    ## Combine across symptoms
+    metab_view <- bind_rows(metab_view_list, .id = "symptom_name")
+    
+    ## Define quantities for plotting
+    metab_view <- metab_view %>%
+        left_join(sens_results_signif_signs) %>%
+        mutate(
+            x_pos = case_when(
+                subset=="v1" & symptom_type=="quant" ~ 1,
+                subset=="v1" & symptom_type=="cat" ~ 2,
+                subset=="v2" & symptom_type=="quant" ~ 3,
+                subset=="v2" & symptom_type=="cat" ~ 4
+            ),
+            num_signif_cat = as.character(num_signif),
+            symptom_name_wrap = str_wrap(symptom_name, width = 15)
+        )
+    
+    ## Sort metabolites by total number of significant hits
+    metab_view_summ <- metab_view %>%
+        group_by(met_name) %>%
+        summarize(tot_signif = sum(num_signif)) %>%
+        arrange(tot_signif)
+    
+    ## Adjust factor levels so that sorting occurs in ggplot
+    metab_view$met_name <- factor(metab_view$met_name, levels = metab_view_summ$met_name)
+    
+    ## Sort symptoms. First in line should be the primary symptom.
+    ## All others: leftmost = most significant detections
+    if (g==1) {
+        first_symptom <- "^Loss"
+    } else if (g==4) {
+        first_symptom <- "^Tiring"
+    }
+    metab_view_summ2 <- metab_view %>%
+        group_by(symptom_name_wrap) %>%
+        summarize(tot_signif = sum(num_signif))
+    metab_view_summ2$tot_signif[str_detect(metab_view_summ2$symptom_name_wrap, first_symptom)] <- .Machine$integer.max
+    metab_view_summ2 <- metab_view_summ2 %>%
+        arrange(desc(tot_signif))
+    ## Adjust factor levels so that sorting occurs in ggplot
+    metab_view$symptom_name_wrap <- factor(metab_view$symptom_name_wrap, levels = metab_view_summ2$symptom_name_wrap)
+    
+    metab_view_signs <- metab_view %>%
+        group_by(met_name, symptom_name) %>%
+        summarize(sign = sign(sum(overall_sign))) %>%
+        mutate(
+            col = case_when(
+                sign > 0 ~ "dodgerblue",
+                sign == 0 ~ "gray90",
+                sign < 0 ~ "firebrick1"
+            ),
+            sign = case_when(
+                sign > 0 ~ "+",
+                sign == 0 ~ "",
+                sign < 0 ~ "-"
+            ),
+            x_pos = 5
+        )
+    
+    cat("Num metabs:", nrow(metab_view_summ), "\n")
+    
+    ## Write results to file
+    metab_view_csv <- metab_view %>%
+        select(-x_pos, -num_signif_cat, -symptom_name_wrap) %>%
+        left_join(sens_results_signif_signs) %>%
+        ungroup() %>%
+        mutate(
+            subset = ifelse(subset=="v1", "Total Group", "mGFR < 20"),
+            symptom_type = ifelse(symptom_type=="cat", "categorical", "quantitative")
+        )
+    write_csv(metab_view_csv, path = paste0("../results/sensitivity_analysis_symptom_group", g, ".csv"))
+    
+    metab_view_signs$met_name <- as.character(metab_view_signs$met_name)
+    metab_view$met_name <- as.character(metab_view$met_name)
+    group_name <- paste("Group", g)
+    metabs_v1 <- unique(data_compare_symp_v1[[group_name]]$BIOCHEMICAL)
+    metabs_v2 <- unique(data_compare_symp_v2[[group_name]]$BIOCHEMICAL)
+    common_metabs <- intersect(metabs_v1, metabs_v2)
+    metab_view_sensfig <- metab_view %>%
+        mutate(
+            common = met_name %in% common_metabs,
+            met_name = ifelse(common, paste0("ZZZ", met_name), met_name)
+        )
+    metab_view_signs <- metab_view_signs %>%
+        mutate(
+            common = met_name %in% common_metabs,
+            met_name = ifelse(common, paste0("ZZZ", met_name), met_name)
+        )
+    # pdf(paste0("../results/figures/sensitivity_analysis_symptom_group", g, ".pdf"), width = 7+3*length(symptom_names), height = 3+nrow(metab_view_summ)/10)
+    pdf(paste0("../results/figures/sensitivity_analysis_symptom_group", g, ".pdf"), width = 10.5, height = 8)
+    p <- ggplot(metab_view_sensfig, aes(x = x_pos, y = met_name, color = num_signif_cat)) +
+        geom_point() +
+        facet_grid(~symptom_name_wrap) +
+        theme_classic() +
+        scale_color_manual(values = c("#FFFFFF00", "#FFFFCC", "#A1DAB4", "#41B6C4", "#225EA8")) +
+        labs(x = "", y = "") +
+        scale_x_continuous(breaks = c(1:4, 1.5, 3.5), labels = c(rep(c("Q", "C"), 2), "\n\nTotal Group", "\n\nmGFR < 20") ) +
+        theme(
+            panel.grid.major.y = element_line(color = "gray"),
+            axis.text = element_text(size = ifelse(nrow(metab_view_summ) > 60, 5, 6))
+        ) +
+        guides(color = guide_legend(title = "# detections across\n sensitivity analyses")) +
+        geom_point(data = metab_view_signs, mapping = aes(x = x_pos, y = met_name), shape = 15, color = "white", size = 5, inherit.aes = FALSE) +
+        geom_text(size = 3, data = metab_view_signs, mapping = aes(x = x_pos, y = met_name, label = sign), inherit.aes = FALSE)
+    print(p)
+    dev.off()
+    
+    ## ML results plot ##############################################
+    ml_results_df_subs <- ml_results_df %>%
+        filter(symptom_name %in% symptom_names) %>%
+        filter(met_name %in% metab_view$met_name) %>%
+        mutate(
+            symptom_name_wrap = str_wrap(symptom_name, width = 15),
+            v1_avg = (rank_lasso_v1+rank_rf_v1)/2,
+            v2_avg = (rank_lasso_v2+rank_rf_v2)/2
+        )
+    
+    ## Adjust factor levels so that sorting occurs in ggplot
+    ml_results_df_subs$met_name <- factor(ml_results_df_subs$met_name, levels = metab_view_summ$met_name)
+    pdf(paste0("../results/figures/ml_results_symptom_group", g, ".pdf"), width = 10.5, height = 8)
+    p <- ggplot(ml_results_df_subs, aes(y = met_name)) +
+        geom_point(aes(x = rank_lasso_v1), color = "#1E90FF1A") +
+        geom_point(aes(x = rank_rf_v1), color = "#FF30301A") +
+        geom_point(aes(x = v1_avg), color = "black") +
+        geom_point(aes(x = rank_lasso_v2), color = "#1E90FF1A") +
+        geom_point(aes(x = rank_rf_v2), color = "#FF30301A") +
+        geom_point(aes(x = v2_avg), color = "black") +
+        geom_vline(xintercept = 2, lty = "dashed", color = "gray50") +
+        scale_x_continuous(breaks = c(0.05, 1.75, 2.25, 3.95, 1,3), labels = c("Low", "High", "Low", "High", "\n\nTotal Group", "\n\nmGFR < 20")) +
+        facet_grid(~symptom_name_wrap) +
+        theme_classic() +
+        labs(x = "Importance rank", y = "") +
+        theme(
+            panel.grid.major.y = element_line(color = "gray"),
+            axis.text = element_text(size = ifelse(nrow(metab_view_summ) > 60, 5, 6))
+        )
+    print(p)
+    dev.off()
+}
+```
+
+
+
+<br><br><br>
+
+
+
+## Characterizing results
+
+> **Broad question:** Are there trends in results related to metabolite `SUPER_PATHWAY` or `SUB_PATHWAY`?
+
+Create one large data frame with all of the results from `sens_results`.
+
+```{r}
+names(sens_results) <- paste0("sens_v", seq_len(length(sens_results)))
+df_all_sens_results <- bind_rows(lapply(sens_results, function(l) {
+    bind_rows(l, .id = "symptom_name")
+}), .id = "sens_version")
+```
+
+Remove unneeded columns. Add in information on the sensitivity analysis parameters.
+
+```{r}
+df_all_sens_results <- select(df_all_sens_results, -PATHWAY_SORTORDER, -(COMP_ID:HMDB_ID)) %>%
+    left_join(combos)
+```
+
+Determine questions to ask of this large data frame.
+
+- What is the distribution of `SUPER_PATHWAY` and `SUB_PATHWAY` within the significant metabolites in the categorical symptom score analyses? In the quantitative symptom score analyses?
+
+- Are the effect directions broadly consistent between all MDRD (subset = v1) and mGFR < 20 (subset = v2)?
+
+
+
+

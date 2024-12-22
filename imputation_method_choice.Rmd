@@ -1,0 +1,922 @@
+---
+title: "MDRD: Picking best imputation method"
+output: html_document
+---
+
+## Load packages
+
+```{r message=FALSE}
+library(readxl)
+library(tidyverse)
+library(SummarizedExperiment)
+library(limma)
+source("S:/lucid/code/utils.R")
+
+library(Amelia)
+library(missForest)
+library(imputeLCMD)
+```
+
+## Reading data
+
+### Read metabolomics data
+
+```{r}
+## Read in row data on metabolites
+row_data <- read_excel("../../../Analysis/Metabolomics data/Original data/JHOP-0501-15MLBL+CDT  2015-12-29.xlsx", sheet = "OrigScale", range = "A11:P1204", col_names = TRUE)
+colnames(row_data)[16] <- "HMDB_ID"
+
+## Read in column data on samples
+col_data <- read_excel("../../../Analysis/Metabolomics data/Original data/JHOP-0501-15MLBL+CDT  2015-12-29.xlsx", sheet = "OrigScale", range = "P1:ACM11", col_names = FALSE)
+col_data <- col_data %>% as.matrix() %>% t()
+colnames(col_data) <- col_data[1,]
+colnames(col_data)[11] <- "Sample"
+col_data <- tail(col_data, -1)
+rownames(col_data) <- NULL
+col_data <- as.data.frame(col_data)
+
+## Store original subject IDs
+orig_col_data_subj_id <- col_data$SUBJECT_ID
+
+## Read in metabolite data
+metab <- read_excel("../../../Analysis/Metabolomics data/Original data/JHOP-0501-15MLBL+CDT  2015-12-29.xlsx", sheet = "OrigScale", range = "Q11:ACM1204", col_names = TRUE)
+metab <- as.matrix(metab) %>% t() %>% as.data.frame()
+colnames(metab) <- paste0("met", seq_len(ncol(metab)))
+```
+
+
+### Read symptom data
+
+`R:\Data\PROC_Contents_pdf\mdb_1_to_98.pdf` contains documentation on all of the contents of the data files in `R:\Data\Stata_Datasets`.
+
+- `mdb_26.csv`: originally from `R:\Data\Stata_Datasets\mdb_26.dta`
+- `Followup.csv`: originally from `R:\Data\Derived\Followup.dta`.
+
+```{r}
+symptoms <- read_csv("../data/mdb_26.csv", guess_max = 27973)
+followup <- read_csv("../data/Followup.csv")
+baseline <- read_csv("../data/Baseline.csv")
+
+symptoms$id <- as.character(symptoms$id)
+followup$id <- as.character(followup$id)
+baseline$id <- as.character(baseline$id)
+```
+
+## Preparing data
+
+Merge symptoms, followup, and baseline (Visit 12).
+
+```{r}
+symptoms <- symptoms %>% filter(VISN==12)
+followup <- followup %>% filter(visn==12)
+baseline <- baseline %>%
+    select(id, study, bp, diet, age, female, racecat, smoke_ever, smoke_packs, smoke_years, diab, cause_ckd_ckdbc)
+
+col_data <- col_data %>%
+    mutate(SUBJECT_ID = SUBJECT_ID %>% as.character()) %>%
+    left_join(symptoms, by = c("SUBJECT_ID" = "id")) %>%
+    left_join(followup, by = c("SUBJECT_ID" = "id")) %>%
+    left_join(baseline, by = c("SUBJECT_ID" = "id"))
+```
+
+Remove rows where metabolomics subject ID doesn't have a corresponding symptoms, followup, and baseline ID.
+
+```{r}
+keep <- (col_data$SUBJECT_ID %in% symptoms$id) & (col_data$SUBJECT_ID %in% followup$id) & (col_data$SUBJECT_ID %in% baseline$id)
+col_data <- col_data[keep,,drop=FALSE]
+```
+
+Fill in missing values for symptom severity. Currently most missing values are for the severity variable when the number of days with the symptom is zero. Fill in a new "zero severity" category for these.
+
+```{r}
+symptom_cols <- sprintf("F26Q%.2i", 5:28)
+for (col in symptom_cols) {
+    col_A <- paste0(col, "A")
+    col_B <- paste0(col, "B")
+    symp_A <- col_data[[col_A]]
+    symp_B <- col_data[[col_B]]
+    bool <- symp_A==0 & is.na(symp_B)
+    symp_B[bool] <- 0
+    col_data[[col_B]] <- symp_B
+}
+```
+
+
+Which values would be most useful for imputation? Ones without too much missingness and that are not date or ID variables. 
+
+```{r}
+df <- data.frame(
+    num = seq_len(ncol(col_data)),
+    name = colnames(col_data),
+    perc_miss = round(colMeans(is.na(col_data)),3)
+)
+rownames(df) <- NULL
+df
+
+cols_remove_from_impute <- c(1:15,64:75,87:88,91,93:94,96,98,104,110:117,121:133,137,156)
+cols_keep <- setdiff(seq_len(ncol(col_data)), cols_remove_from_impute)
+col_data_subject_id <- col_data$SUBJECT_ID
+col_data <- col_data[,cols_keep,drop=FALSE]
+
+## select_cols contains the variables used in the analysis (except `study`)
+select_cols_lab_demo <- c("age", "female", "racecat", "diab", "cause_ckd_ckdbc", "smoke_years", "sys", "upro", "uun", "gfr", "bmi")
+select_cols_symptoms <- c(sprintf("F26Q%.2iA", 5:28), sprintf("F26Q%.2iB", 5:28))
+select_cols <- c(select_cols_lab_demo, select_cols_symptoms)
+
+## Make sure that all of these are in col_data still: yes!
+all(select_cols %in% colnames(col_data))
+```
+
+Write codebook with missingness information to file.
+
+```{r}
+df_subs <- df[cols_keep,,drop=FALSE]
+df_subs$name <- as.character(df_subs$name)
+
+## Read in codebook
+codebook <- readLines("../data/Baseline_codebook.txt")
+lines_dashes <- which(str_detect(codebook, "^---"))
+lines_variables <- lines_dashes[seq(1, by = 2, to = length(lines_dashes)-2)]+1
+codebook_split <- codebook[lines_variables] %>%
+    str_split(" {4,}")
+all(lengths(codebook_split)==2)
+df_codebook <- tibble(
+    name = sapply(codebook_split, "[[", 1),
+    descrip = sapply(codebook_split, "[[", 2)
+)
+df_codebook <- bind_rows(
+    df_codebook,
+    tibble(
+        name = c("edema", "unccr", "ccr", "suncr", "F26Q05A", "F26Q05B", "F26Q06A", "F26Q06B", "F26Q07A", "F26Q07B", "F26Q08A", "F26Q08B", "F26Q09A", "F26Q09B", "F26Q10A", "F26Q10B", "F26Q11A", "F26Q11B", "F26Q12A", "F26Q12B", "F26Q13A", "F26Q13B", "F26Q14A", "F26Q14B", "F26Q15A", "F26Q15B", "F26Q16A", "F26Q16B", "F26Q17A", "F26Q17B", "F26Q18A", "F26Q18B", "F26Q19A", "F26Q19B", "F26Q20A", "F26Q20B", "F26Q21A", "F26Q21B", "F26Q22A", "F26Q22B", "F26Q23A", "F26Q23B", "F26Q24A", "F26Q24B", "F26Q25A", "F26Q25B", "F26Q26A", "F26Q26B", "F26Q27A", "F26Q27B", "F26Q28A", "F26Q28B"),
+        descrip = c("Edema", "Unadjusted creatinine clearance", "Creatinine clearance", "SUN/creatinine", "A Bad Taste In Your Mouth? DAYS", "A Bad Taste In Your Mouth? SEVERITY", "Loss Of Appetite? DAYS", "Loss Of Appetite? SEVERITY", "Nausea Or Sick To Your Stomach? DAYS", "Nausea Or Sick To Your Stomach? SEVERITY", "Vomiting? DAYS", "Vomiting? SEVERITY", "Heartburn? DAYS", "Heartburn? SEVERITY", "Abdominal Bloating Or Gas? DAYS", "Abdominal Bloating Or Gas? SEVERITY", "Diarrhea? DAYS", "Diarrhea? SEVERITY", "Constipation? DAYS", "Constipation? SEVERITY", "Hiccoughs? DAYS", "Hiccoughs? SEVERITY", "Itching Of The Skin? DAYS", "Itching Of The Skin? SEVERITY", "Hives Or Another Type Of Rash? DAYS", "Hives Or Another Type Of Rash? SEVERITY", "Easy Bruising Or Bleeding? DAYS", "Easy Bruising Or Bleeding? SEVERITY", "Lack Of Pep And Energy? DAYS", "Lack Of Pep And Energy? SEVERITY", "Tiring Easily, Weakness? DAYS", "Tiring Easily, Weakness? SEVERITY", "Muscle Cramps? DAYS", "Muscle Cramps? SEVERITY", "Numbness,Tingling In Hands-Feet? DAYS", "Numbness,Tingling In Hands-Feet? SEVERITY", "Feeling Faint When You Stand Up? DAYS", "Feeling Faint When You Stand Up? SEVERITY", "Difficulty Falling,Staying Asleep? DAYS", "Difficulty Falling,Staying Asleep? SEVERITY", "Falling Asleep During The Day? DAYS", "Falling Asleep During The Day? SEVERITY", "Feeling Irritable? DAYS", "Feeling Irritable? SEVERITY", "Decreased Alertness? DAYS", "Decreased Alertness? SEVERITY", "Forgetfulness? DAYS", "Forgetfulness? SEVERITY", "Blurred Vision? DAYS", "Blurred Vision? SEVERITY", "Other Unexpected Symptoms? DAYS", "Other Unexpected Symptoms? SEVERITY")
+    )
+)
+
+symptom_nums <- c(5:8, 14, 17, 18, 20, 23, 25, 26)
+symptom_nums <- sprintf("%.2d", symptom_nums)
+A_col <- paste0("F26Q", symptom_nums, "A")
+B_col <- paste0("F26Q", symptom_nums, "B")
+symptom_var_names_main_analysis <- c(A_col, B_col)
+df_subs2 <- df_subs %>%
+    left_join(df_codebook) %>%
+    mutate(perc_miss = paste0(100*perc_miss, "%")) %>%
+    mutate(in_main_analysis = name %in% c("age", "female", "racecat", "diab", "cause_ckd_ckdbc", "smoke_years", "sys", "upro", "uun", "gfr", "bmi", "study")) %>%
+    mutate(in_main_analysis = in_main_analysis | name %in% symptom_var_names_main_analysis)
+
+write_csv(df_subs2, path = "../results/imputation_variables_table.csv")
+```
+
+Create missing data by hand so that the true values of the missing values are known.
+
+```{r}
+#' @param dat The data (a data.frame)
+#' @param cols A character vector of the columns in which data will be removed. If NULL, all columns will be used.
+#' @param num Number of cases per column to make NA. Can be a single integer, in which case, the same number of cases are deleted in each column. Or can be an integer vector of the same length as `cols`, indicating the number of cases to delete in each column.
+#' @return The original data with missing values introduced
+create_missingness <- function(dat, cols = NULL, num, method = c("mcar", "left_cens")) {
+    method <- match.arg(method)
+    
+    ## If cols is NULL, all columns will be used
+    if (is.null(cols)) {
+        cols <- colnames(dat)
+    }
+    
+    ## Argument checking on num
+    if (length(num)!=1 & length(num)!=length(cols)) {
+        stop("length(num) is not equal to 1 or length(cols)")
+    }
+    if (length(num)==1) {
+        num <- rep(num, length(cols))
+    }
+    
+    ## Loop over desired columns
+    for (i in seq_along(cols)) {
+        col <- cols[i]
+        n <- num[i]
+        
+        ## Get rows of non-NA entries
+        idx_not_na <- which(!is.na(dat[[col]]))
+        
+        ## Update number to make missing in case of too few non-NAs
+        n_actual <- min(n, length(idx_not_na))
+        
+        ## If all values are missing, move to next variable
+        if (length(idx_not_na)==0)
+            next
+        
+        if (method=="mcar") {
+            ## Randomly select among the non-missing observations
+            idx_make_na <- sample(idx_not_na, size = n_actual)
+        } else if (method=="left_cens") {
+            ## Select the smallest observations
+            o <- order(dat[[col]])
+            idx_make_na <- head(o, n_actual)
+        }
+        ## Make values NA
+        dat[[col]][idx_make_na] <- NA
+    }
+    
+    dat
+}
+```
+
+Create missingness for `col_data`.
+
+```{r}
+set.seed(151)
+col_data_na <- create_missingness(col_data, cols = NULL, num = 10)
+```
+
+Create missingness for metabolomics data.
+
+```{r}
+set.seed(167)
+log_metab <- log2(metab)
+## Remember: for this script, metab has columns = metabs & rows = samples
+keep <- colSums(!is.na(log_metab)) >= 10 & colVars(as.matrix(log_metab), na.rm = TRUE) > 1e-6
+log_metab_subs <- log_metab[,keep,drop=FALSE]
+log_metab_subs_na <- create_missingness(log_metab_subs, cols = NULL, num = 10)
+
+dim(log_metab)
+dim(log_metab_subs)
+```
+
+
+## Imputation
+
+### Exploratory plots
+
+```{r fig.width=15,fig.height=75}
+par(mfrow = c(ceiling(ncol(col_data)/5),5))
+for (cn in colnames(col_data)) {
+    col <- col_data[[cn]]
+    if (is.character(col)) {
+        barplot(table(col, useNA = "ifany"), main = cn)
+    } else {
+        plot(density(col, na.rm = TRUE), main = cn)
+    }
+}
+```
+
+### Functions for evaluating imputation methods
+
+```{r}
+get_imputation_error <- function(data_truth, data_forced_na, data_imputed, col_types) {
+    ## In case some variables were dropped,
+    ## obtain variables that are in both truth and imputed
+    common_cols <- intersect(colnames(data_truth), colnames(data_imputed))
+    
+    ## All columns are of the same type
+    if (length(col_types)==1) {
+        col_types <- rep(col_types, length(common_cols))
+    }
+    
+    ## Loop over variables
+    errs <- sapply(seq_along(common_cols), function(i) {
+        col <- common_cols[i]
+        col_type <- col_types[i]
+        truth <- data_truth[[col]]
+        forced_na <- data_forced_na[[col]]
+        guess <- data_imputed[[col]]
+        
+        ## Subset to only places where NAs were manually inserted
+        bool <- !is.na(truth) & is.na(forced_na)
+        
+        ## Compute error (RMSE and misclassification rate)
+        if (col_type=="quant") {
+            err <- mean((truth[bool]-guess[bool])^2) %>% sqrt()
+        } else {
+            err <- mean(truth[bool] != guess[bool])*100
+        }
+        err
+    })
+    names(errs) <- common_cols
+    
+    errs
+}
+```
+
+
+### VIM
+
+Could not install the `VIM` package (for KNN).
+
+
+
+### Amelia
+
+#### Lab and demographics
+
+It is important to specify the "B" symptoms variables as `ords` rather than `noms`--not only because ordinal is a more precise description but also because computation time improves in this way.
+
+```{r cache=TRUE}
+set.seed(183)
+system.time({
+col_data_na_amelia <- amelia(col_data_na, m = 5, logs = sprintf("F26Q%.2iA", 5:28), ords = sprintf("F26Q%.2iB", 5:28), noms = c("bp", "diet", "edema", "female", "racecat", "smoke_ever", "diab", "cause_ckd_ckdbc"))
+})
+```
+
+Another approach: Separate the symptoms data and the lab+demographics data. Impute these datasets separately.
+
+```{r cache=TRUE}
+col_data_na_symp <- col_data_na[,1:48]
+col_data_na_labdemo <- col_data_na[,49:108]
+
+set.seed(195)
+system.time({
+col_data_na_symp_amelia <- amelia(col_data_na_symp, m = 5, logs = sprintf("F26Q%.2iA", 5:28), ords = sprintf("F26Q%.2iB", 5:28))
+})
+
+system.time({
+col_data_na_labdemo_amelia <- amelia(col_data_na_labdemo, m = 5, noms = c("bp", "diet", "edema", "female", "racecat", "smoke_ever", "diab", "cause_ckd_ckdbc"))
+})
+```
+
+Look at accuracy of `Amelia` imputations. (Symptoms & lab+demo were split)
+
+```{r}
+col_types <- rep("quant", ncol(col_data))
+names(col_types) <- colnames(col_data)
+col_types[sprintf("F26Q%.2iB", 5:28)] <- "ord"
+col_types[c("bp", "diet", "edema", "female", "racecat", "smoke_ever", "diab", "cause_ckd_ckdbc")] <- "categ"
+
+amelia_imps <- lapply(1:5, function(i) {
+    imp <- paste0("imp", i)
+    cbind(
+        col_data_na_symp_amelia$imputations[[imp]],
+        col_data_na_labdemo_amelia$imputations[[imp]]
+    )
+})
+
+imputation_error <- tibble(variable = colnames(col_data))
+
+amelia_err_results <- bind_cols(
+    lapply(amelia_imps, function(imp) {
+        get_imputation_error(
+            data_truth = col_data,
+            data_forced_na = col_data_na,
+            data_imputed = imp,
+            col_types = col_types
+        )
+    })
+)
+colnames(amelia_err_results) <- paste0("amelia_imp", 1:5)
+
+stopifnot(nrow(imputation_error)==nrow(amelia_err_results))
+imputation_error <- bind_cols(imputation_error, amelia_err_results)
+```
+
+Look at accuracy of `Amelia` imputations. (Symptoms & lab+demo were left combined.)
+
+```{r}
+combined_amelia_err_results <- bind_cols(
+    lapply(col_data_na_amelia$imputations, function(imp) {
+        get_imputation_error(
+            data_truth = col_data,
+            data_forced_na = col_data_na,
+            data_imputed = imp,
+            col_types = col_types
+        )
+    })
+)
+colnames(combined_amelia_err_results) <- paste0("combined_amelia_imp", 1:5)
+
+stopifnot(nrow(imputation_error)==nrow(combined_amelia_err_results))
+imputation_error <- cbind(imputation_error, combined_amelia_err_results)
+```
+
+
+#### Metabolomics data
+
+Amelia won't run when there are columns where all or where all but one value are missing or when any columns have zero variance.
+
+Increasing the empirical prior (`empri`) to extremely high values is not enough for Amelia to run.
+
+```{r eval=FALSE}
+keep <- colSums(!is.na(metab)) >= 2 & colVars(as.matrix(metab), na.rm = TRUE) > 0
+metab_subs <- metab[,keep,drop=FALSE]
+set.seed(213)
+system.time({
+metab_amelia <- amelia(metab_subs, m = 5, logs = colnames(metab_subs), empri = nrow(metab_subs))
+})
+```
+
+
+
+<br><br><br>
+
+
+
+### missForest
+
+#### Lab and demographics
+
+```{r}
+col_data_na_recode <- col_data_na
+for (i in seq_len(ncol(col_data_na_recode))) {
+    if (col_types[i] != "quant") {
+        col_data_na_recode[[i]] <- as.factor(col_data_na_recode[[i]])
+    }
+}
+```
+
+```{r cache=TRUE}
+set.seed(271)
+col_data_na_mf <- missForest(col_data_na_recode, variablewise = TRUE)
+```
+
+Look at accuracy of `missForest` imputations.
+
+```{r}
+mf_err_results <- get_imputation_error(
+    data_truth = col_data,
+    data_forced_na = col_data_na,
+    data_imputed = col_data_na_mf$ximp,
+    col_types = col_types
+)
+
+stopifnot(length(mf_err_results)==nrow(imputation_error))
+imputation_error <- cbind(imputation_error, mf = mf_err_results)
+```
+
+#### Metabolomics
+
+`mtry = 5`
+
+```{r cache=TRUE}
+set.seed(324)
+system.time({
+log_metab_subs_na_mf_mtry5 <- missForest(log_metab_subs_na, mtry = 5, variablewise = TRUE)
+})
+
+mf_err_results_mtry5 <- get_imputation_error(
+    data_truth = log_metab_subs,
+    data_forced_na = log_metab_subs_na,
+    data_imputed = log_metab_subs_na_mf_mtry5$ximp,
+    col_types = "quant"
+)
+```
+
+`mtry = 15`
+
+```{r cache=TRUE}
+set.seed(352)
+system.time({
+log_metab_subs_na_mf_mtry15 <- missForest(log_metab_subs_na, mtry = 15, variablewise = TRUE)
+})
+
+mf_err_results_mtry15 <- get_imputation_error(
+    data_truth = log_metab_subs,
+    data_forced_na = log_metab_subs_na,
+    data_imputed = log_metab_subs_na_mf_mtry15$ximp,
+    col_types = "quant"
+)
+```
+
+`mtry = 30` (very close to square root of number of predictors)
+
+```{r cache=TRUE}
+system.time({
+log_metab_subs_na_mf_mtry30 <- missForest(log_metab_subs_na, mtry = 30, variablewise = TRUE)
+})
+
+mf_err_results_mtry30 <- get_imputation_error(
+    data_truth = log_metab_subs,
+    data_forced_na = log_metab_subs_na,
+    data_imputed = log_metab_subs_na_mf_mtry30$ximp,
+    col_types = "quant"
+)
+```
+
+Compare error for the different `mtry` values.
+
+```{r}
+mf_error_metab <- tibble(metab = colnames(log_metab_subs))
+mf_error_metab <- mf_error_metab %>%
+    left_join(
+        tibble(metab = names(mf_err_results_mtry5), error5 = mf_err_results_mtry5)
+    ) %>%
+    left_join(
+        tibble(metab = names(mf_err_results_mtry15), error15 = mf_err_results_mtry15)
+    ) %>%
+    left_join(
+        tibble(metab = names(mf_err_results_mtry30), error30 = mf_err_results_mtry30)
+    )
+
+plot_ma(mf_error_metab$error5, mf_error_metab$error15)
+plot_ma(mf_error_metab$error5, mf_error_metab$error30)
+plot_ma(mf_error_metab$error15, mf_error_metab$error30)
+```
+
+**Conclusions:** It looks like `mtry = 30` is the best parameter for `missForest`.
+
+
+
+<br><br><br>
+
+
+
+### imputeLCMD for metabolomics
+
+The `imputeLCMD` package provides tools for imputing left censored data.
+
+**NOTE:** The data is assumed to be features (rows) by samples (cols) and NOT a standard data frame.
+
+```{r}
+set.seed(455)
+log_metab_subs_na_qrilc <- impute.QRILC(log_metab_subs_na %>% t())
+log_metab_subs_na_qrilc <- log_metab_subs_na_qrilc[[1]]
+log_metab_subs_na_qrilc <- log_metab_subs_na_qrilc %>% t() %>% as.data.frame()
+```
+
+Evaluate error.
+
+```{r}
+qrilc_err_results <- get_imputation_error(
+    data_truth = log_metab_subs,
+    data_forced_na = log_metab_subs_na,
+    data_imputed = log_metab_subs_na_qrilc,
+    col_types = "quant"
+)
+```
+
+```{r}
+plot(density(log_metab_subs_na_qrilc$met1), xlab = "Log2 abundance", main = "")
+lines(density(log_metab_subs$met1, na.rm = TRUE), col = "red")
+legend("topright", legend = c("imputed", "observed"), col = c("black", "red"), lwd = 2)
+```
+
+
+
+<br><br><br>
+
+
+
+### Comparing accuracy of `missForest` and `Amelia` on lab & demographics
+
+Overall the `missForest` imputations are a little more accurate than the `Amelia` imputations.
+
+```{r}
+## Separated symptoms & lab+demo
+table(rowSums(imputation_error[,2:6] > imputation_error[,12]))
+table(rowSums(imputation_error[,2:6] > imputation_error[,12]) >= 3)
+
+## Combined symptoms & lab+demo
+table(rowSums(imputation_error[,7:11] > imputation_error[,12]))
+table(rowSums(imputation_error[,7:11] > imputation_error[,12]) >= 3)
+```
+
+Take a closer look at the variables where `missForest` tends to do better and where `Amelia` tends to do better.
+
+```{r}
+imputation_error_reshaped <- imputation_error %>%
+    pivot_longer(-variable, names_to = "method", values_to = "error") %>%
+    mutate(method_general = case_when(
+        str_detect(method, "^amelia_imp") ~ "amelia_sep",
+        str_detect(method, "^combined_amelia_imp") ~ "amelia_comb",
+        TRUE ~ "mf"
+    ))
+```
+
+**Symptom variables:** Days with symptom ("A" questions)
+
+```{r}
+imputation_error_reshaped %>%
+    filter(str_detect(variable, "^F26Q.{2}A$")) %>%
+    ggplot(aes(x = variable, y = error, color = method_general)) +
+        geom_point() +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+**Symptom variables:** Severity of symptoms ("B" questions)
+
+```{r}
+imputation_error_reshaped %>%
+    filter(str_detect(variable, "^F26Q.{2}B$")) %>%
+    ggplot(aes(x = variable, y = error, color = method_general)) +
+        geom_point() +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+**Symptom variables (both A and B) for only the symptoms under study**:
+
+```{r}
+symptom_nums <- c(5:8, 14, 17, 18, 20, 23, 25, 26)
+imputation_error_reshaped %>%
+    filter(variable %in% c(sprintf("F26Q%.2iA", symptom_nums), sprintf("F26Q%.2iB", symptom_nums))) %>%
+    ggplot(aes(x = variable, y = error, color = method_general)) +
+        geom_point() +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+**Other lab and demographic variables** (all non-symptom variables)
+
+```{r}
+imputation_error_reshaped %>%
+    filter(!str_detect(variable, "^F26Q.{2}[AB]$")) %>%
+    ggplot(aes(x = variable, y = error, color = method_general)) +
+        geom_point() +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+imputation_error_reshaped %>%
+    filter(!str_detect(variable, "^F26Q.{2}[AB]$")) %>%
+    ggplot(aes(x = variable, y = error, color = method_general)) +
+        geom_point() +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+        coord_cartesian(ylim = c(0,250))
+```
+
+> **Summary**: In looking at both broad-scale metrics and performance on individual variables, it looks like:
+> - `missForest` imputations are slightly more often more accurate than all 5 of `Amelia`'s (or at least close to all 5)
+> - When `missForest` is not strictly better, it is usually on par or indistinguishable from `Amelia`.
+> Overall, `missForest` is preferred.
+
+
+### Tables of imputation error for covariates
+
+```{r}
+symptom_nums <- c(5:8, 14, 17, 18, 20, 23, 25, 26)
+select_var_names <- c(sprintf("F26Q%.2iA", symptom_nums), sprintf("F26Q%.2iB", symptom_nums), "age", "female", "racecat", "diab", "cause_ckd_ckdbc", "smoke_years", "sys", "upro", "uun", "gfr", "bmi")
+select_var_names2 <- c(sprintf("F26Q%.2iA", symptom_nums), sprintf("F26Q%.2iB", symptom_nums), "age", "smoke_years", "sys", "upro", "uun", "gfr", "bmi")
+col_data_ranges <- sapply(col_data[,select_var_names2], function(x) {
+    diff(range(x))
+})
+col_data_ranges <- tibble(
+    variable = select_var_names2,
+    range = col_data_ranges
+)
+
+imputation_errors <- imputation_error_reshaped %>%
+    filter(variable %in% select_var_names) %>%
+    group_by(variable, method_general) %>%
+    summarize(avg_error = mean(error)) %>%
+    pivot_wider(id_cols = variable, names_from = method_general, values_from = avg_error) %>%
+    left_join(col_data_ranges) %>%
+    mutate(
+        amelia_comb_rel = amelia_comb/range,
+        amelia_sep_rel = amelia_sep/range,
+        mf_rel = mf/range
+    )
+
+write_csv(imputation_errors, "../results/imputation_error_covariates.csv")
+```
+
+
+
+<br><br><br>
+
+
+
+### Running missForest on original `col_data`
+
+```{r}
+col_types <- rep("quant", ncol(col_data))
+names(col_types) <- colnames(col_data)
+col_types[sprintf("F26Q%.2iB", 5:28)] <- "ord"
+col_types[c("bp", "diet", "edema", "female", "racecat", "smoke_ever", "diab", "cause_ckd_ckdbc")] <- "categ"
+
+for (i in seq_len(ncol(col_data))) {
+    if (col_types[i] != "quant") {
+        col_data[[i]] <- as.factor(col_data[[i]])
+    }
+}
+```
+
+```{r}
+set.seed(437)
+col_data_mf <- missForest(col_data, variablewise = TRUE)
+```
+
+```{r}
+col_data_mf <- col_data_mf$ximp
+stopifnot(length(col_data_subject_id)==nrow(col_data_mf))
+col_data_mf$SUBJECT_ID <- col_data_subject_id
+save(col_data_mf, file = "../data/col_data_imputed.rda")
+```
+
+
+
+<br><br><br>
+
+
+
+### Comparing accuracy of `missForest` and `QRILC` on metabolomics
+
+```{r}
+error_metab <- left_join(
+    mf_error_metab,
+    tibble(
+        metab = names(qrilc_err_results),
+        qrilc = qrilc_err_results
+    )
+)
+```
+
+QRILC performs quite poorly--it imputes values that are consistently shifted downwards relative to the actual data distribution, which makes sense given its attempt to capture left censoring.
+
+```{r}
+table(error_metab$error5 < error_metab$qrilc, useNA = "ifany")
+table(error_metab$error15 < error_metab$qrilc, useNA = "ifany")
+table(error_metab$error30 < error_metab$qrilc, useNA = "ifany")
+
+plot(density(error_metab$qrilc, na.rm = TRUE))
+lines(density(error_metab$error30, na.rm = TRUE), col = "red")
+plot_ma(error_metab$error5, error_metab$qrilc)
+plot_ma(error_metab$error15, error_metab$qrilc)
+plot_ma(error_metab$error30, error_metab$qrilc)
+```
+
+The likely explanation for the apparent poor performance of QRILC is the mechanism used to generate the fake missing data--used an MCAR mechanism.
+
+
+
+<br><br><br>
+
+
+
+### Alternate evaluation of `missForest` and `imputeLCMD`
+
+Perform a different evaluation of the imputation methods by generating missing data that would arise from left censoring. Instead of dropping observations completely at random, drop the lowest values.
+
+```{r}
+set.seed(622)
+log_metab_subs_left_cens <- create_missingness(log_metab_subs, cols = NULL, num = 10, method = "left_cens")
+```
+
+#### QRILC
+
+
+```{r}
+bool <- rowMeans(is.na(log_metab_subs_left_cens)) < 0.8
+table(bool)
+
+set.seed(645)
+log_metab_subs_left_cens_qrilc <- impute.QRILC(log_metab_subs_left_cens[bool,] %>% t())
+log_metab_subs_left_cens_qrilc <- log_metab_subs_left_cens_qrilc[[1]]
+log_metab_subs_left_cens_qrilc <- log_metab_subs_left_cens_qrilc %>% t() %>% as.data.frame()
+```
+
+Evaluate error.
+
+```{r}
+qrilc_err_results_lc <- get_imputation_error(
+    data_truth = log_metab_subs[bool,],
+    data_forced_na = log_metab_subs_left_cens[bool,],
+    data_imputed = log_metab_subs_left_cens_qrilc,
+    col_types = "quant"
+)
+
+met_true <- log_metab_subs$met1[bool]
+met_guessed <- log_metab_subs_left_cens_qrilc$met1
+
+plot_ma(met_true, met_guessed)
+plot(density(qrilc_err_results_lc))
+```
+
+Run QRILC using the opposite matrix orientation. Rows = samples, cols = metabolites.
+
+```{r}
+bool <- colSums(!is.na(log_metab_subs_left_cens)) >= 10
+table(bool)
+
+set.seed(645)
+log_metab_subs_left_cens_qrilc2 <- impute.QRILC(log_metab_subs_left_cens[,bool])
+log_metab_subs_left_cens_qrilc2 <- log_metab_subs_left_cens_qrilc2[[1]]
+
+qrilc_err_results_lc2 <- get_imputation_error(
+    data_truth = log_metab_subs,
+    data_forced_na = log_metab_subs_left_cens,
+    data_imputed = log_metab_subs_left_cens_qrilc2,
+    col_types = "quant"
+)
+
+met_true <- log_metab_subs$met1
+met_guessed <- log_metab_subs_left_cens_qrilc2$met1
+
+plot_ma(met_true, met_guessed)
+plot(density(qrilc_err_results_lc2))
+```
+
+#### missForest
+
+```{r cache=TRUE}
+set.seed(697)
+system.time({
+log_metab_subs_left_cens_mf <- missForest(log_metab_subs_left_cens, variablewise = TRUE)
+})
+```
+
+Evaluate error.
+
+```{r}
+mf_err_results_lc <- get_imputation_error(
+    data_truth = log_metab_subs,
+    data_forced_na = log_metab_subs_left_cens,
+    data_imputed = log_metab_subs_left_cens_mf$ximp,
+    col_types = "quant"
+)
+
+met_true <- log_metab_subs$met1
+met_guessed <- log_metab_subs_left_cens_mf$ximp$met1
+
+plot_ma(met_true, met_guessed)
+plot(density(mf_err_results_lc))
+```
+
+#### Compare error distributions between methods
+
+```{r}
+plot(density(qrilc_err_results_lc, from = 0), xlab = "RMSE", main = "", ylim = c(0,0.75))
+lines(density(qrilc_err_results_lc2, from = 0), col = "blue")
+lines(density(mf_err_results_lc, from = 0), col = "red")
+legend("topright", legend = c("QRILC", "QRILC (flip)", "MF"), col = c("black", "blue", "red"), lwd = 2)
+
+summary(qrilc_err_results_lc)
+summary(qrilc_err_results_lc2)
+summary(mf_err_results_lc)
+```
+
+For left censored data, the mode in which QRILC is run has a substantial influence on performance. It is better than random forests when run "the wrong way" but worse when run in the intended way.
+
+#### Hybrid MAR/MNAR imputation
+
+The `model.Selector` function determines for each metabolite whether an MNAR or non-MNAR method would be better for imputation. A "1" indicates that the metabolite should be imputed using a MAR/MCAR method, and "0" for MNAR.
+
+Apparently MNAR is really not needed.
+
+```{r}
+mnar_indicator <- imputeLCMD::model.Selector(log_metab_subs %>% t())
+table(mnar_indicator[[1]])
+```
+
+
+
+<br><br><br>
+
+
+
+### Running QRILC on metabolomics data
+
+```{r}
+bool <- colSums(!is.na(log_metab_subs)) >= 10 & colVars(as.matrix(log_metab_subs), na.rm = TRUE) > 1e-6
+table(bool)
+
+set.seed(788)
+log_metab_subs_qrilc <- impute.QRILC(log_metab_subs[,bool,drop=FALSE])
+
+## Make sure no NAs remain
+which(is.na(log_metab_subs_qrilc[[1]]), arr.ind = TRUE)
+```
+
+```{r}
+log_metab_subs_qrilc <- log_metab_subs_qrilc[[1]]
+
+## Check dimensions
+dim(log_metab_subs_qrilc)
+
+## Make sure number of samples matches up
+stopifnot(length(orig_col_data_subj_id)==nrow(log_metab_subs_qrilc))
+
+## Add subject IDs back in
+log_metab_subs_qrilc$SUBJECT_ID <- orig_col_data_subj_id
+
+save(log_metab_subs_qrilc, file = "../data/metab_imputed_qrilc.rda")
+```
+
+#### Are imputed abundances lower than minimum observed abundances?
+
+Not generally. That's because the imputation is probabilistic.
+
+```{r}
+orig_metab <- log_metab_subs[,bool,drop=FALSE]
+imputed_metab <- log_metab_subs_qrilc[,colnames(orig_metab)]
+orig_metab <- as.matrix(orig_metab)
+imputed_metab <- as.matrix(imputed_metab)
+
+
+## Get imputed values for originally missing data
+is_imp_lower <- do.call(rbind, lapply(seq_len(ncol(orig_metab)), function(i) {
+    is_miss <- is.na(orig_metab[,i])
+    orig_min <- min(orig_metab[,i], na.rm = TRUE)
+    imp_vals <- imputed_metab[is_miss,i]
+    c(sum(imp_vals <= orig_min), sum(imp_vals > orig_min))
+}))
+table(is_imp_lower[,2]==0)
+```
+
+### Table of imputation errors for metabolomics
+
+```{r}
+met_names <- names(qrilc_err_results_lc2)
+imputation_errors_metab <- tibble(
+    metab_name = met_names,
+    err_qrilc = qrilc_err_results_lc2[met_names],
+    err_mf = mf_err_results_lc[met_names]
+)
+
+write_csv(imputation_errors_metab, "../results/imputation_error_metabolites.csv")
+```
+
+
+
+
